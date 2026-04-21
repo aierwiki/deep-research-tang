@@ -1,0 +1,41 @@
+{
+  "round": 1,
+  "tasks": [
+    {
+      "task_id": "R01-T01",
+      "title": "梳理网关方案的架构收益",
+      "task_type": "exploratory",
+      "research_dimension": "architecture",
+      "key_question": "该方案会如何改变现有接入架构？",
+      "planned_actions": [
+        "阅读架构文档",
+        "对比现有接入链路",
+        "记录潜在收益"
+      ],
+      "expected_evidence": [
+        "架构对比",
+        "收益条目"
+      ],
+      "depends_on": [],
+      "report_path": "round_01/tasks/task_01_architecture.md"
+    },
+    {
+      "task_id": "R01-T02",
+      "title": "寻找失败案例与风险",
+      "task_type": "counterevidence",
+      "research_dimension": "risk",
+      "key_question": "该方案最容易在哪些场景下失效？",
+      "planned_actions": [
+        "搜索失败案例",
+        "查阅官方限制",
+        "汇总风险条件"
+      ],
+      "expected_evidence": [
+        "失败案例",
+        "限制说明"
+      ],
+      "depends_on": [],
+      "report_path": "round_01/tasks/task_02_risk.md"
+    }
+  ]
+}

@@ -1,0 +1,8 @@
+{
+  "topic": "replace-with-topic",
+  "original_question": "replace-with-user-question",
+  "target_depth": 3,
+  "depth_mode": "auto",
+  "current_round": 0,
+  "status": "initialized"
+}

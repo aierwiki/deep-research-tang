@@ -1,0 +1,42 @@
+{
+  "round": 1,
+  "new_findings": [
+    {
+      "finding_id": "R01-F01",
+      "summary": "replace-with-new-finding",
+      "source_tasks": [
+        "R01-T01"
+      ]
+    },
+    {
+      "finding_id": "R01-F02",
+      "summary": "replace-with-new-finding",
+      "source_tasks": [
+        "R01-T02"
+      ]
+    },
+    {
+      "finding_id": "R01-F03",
+      "summary": "replace-with-new-finding",
+      "source_tasks": [
+        "R01-T03"
+      ]
+    }
+  ],
+  "contradictions": [
+    {
+      "summary": "replace-with-contradiction",
+      "source_tasks": [
+        "R01-T01"
+      ]
+    }
+  ],
+  "carry_forward_clues": [
+    {
+      "clue_id": "R01-CF01",
+      "from_finding_id": "R01-F01",
+      "question": "replace-with-next-round-question"
+    }
+  ],
+  "coverage_assessment": "replace-with-coverage-assessment"
+}

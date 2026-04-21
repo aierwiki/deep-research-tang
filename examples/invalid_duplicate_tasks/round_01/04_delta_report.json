@@ -1,0 +1,36 @@
+{
+  "round": 1,
+  "new_findings": [
+    {
+      "finding_id": "R01-F01",
+      "summary": "只得到了简介信息。",
+      "source_tasks": [
+        "R01-T01"
+      ]
+    },
+    {
+      "finding_id": "R01-F02",
+      "summary": "两个任务高度重复。",
+      "source_tasks": [
+        "R01-T01",
+        "R01-T02"
+      ]
+    },
+    {
+      "finding_id": "R01-F03",
+      "summary": "缺少真正独立的研究维度。",
+      "source_tasks": [
+        "R01-T02"
+      ]
+    }
+  ],
+  "contradictions": [],
+  "carry_forward_clues": [
+    {
+      "clue_id": "R01-CF01",
+      "from_finding_id": "R01-F03",
+      "question": "如何补充真正独立的任务？"
+    }
+  ],
+  "coverage_assessment": "当前样例故意不合格。"
+}

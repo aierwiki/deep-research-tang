@@ -1,0 +1,12 @@
+{
+  "round": 1,
+  "seed_clues": [
+    {
+      "clue_id": "R01-C01",
+      "source_round": 0,
+      "source_ref": "original-question",
+      "question": "该方案能否降低统一接入复杂度？",
+      "why_it_matters": "这是用户决策的核心问题。"
+    }
+  ]
+}

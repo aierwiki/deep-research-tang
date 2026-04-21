@@ -1,0 +1,8 @@
+{
+  "topic": "bad-sample",
+  "original_question": "判断某方案是否可行。",
+  "target_depth": 1,
+  "depth_mode": "auto",
+  "current_round": 1,
+  "status": "in_progress"
+}

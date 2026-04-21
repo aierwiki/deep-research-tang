@@ -1,0 +1,1800 @@
+/**
+ * deep-research-guard: OpenClaw runtime plugin
+ *
+ * This plugin does not try to "catch" completion at the end of the run.
+ * Instead it shifts enforcement earlier:
+ *
+ * - before_prompt_build: inject the minimum current-step protocol so the agent
+ *   is reminded what phase it is in and what is forbidden right now.
+ * - before_tool_call: block exploratory work when archive/state prerequisites
+ *   are missing, incomplete, or still placeholder-filled.
+ * - before_message_write: catch plain-text stop attempts before the archive is complete
+ *   and immediately re-wake the same session with a trusted continuation nudge.
+ * - after_tool_call / agent_end: write audit markers for analysis and recovery.
+ */
+
+"use strict";
+
+const fs = require("fs");
+const path = require("path");
+const { execFileSync } = require("child_process");
+
+const ACTIVE_SESSIONS = new Map();
+
+const PLACEHOLDER_PATTERNS = [
+  "replace-with",
+  "action-1",
+  "action-2",
+  "action-3",
+  "evidence-1",
+];
+
+const ARCHIVE_WRITE_TOOLS = new Set([
+  "write",
+  "edit",
+  "apply_patch",
+  "str_replace_editor",
+]);
+
+const ARCHIVE_FILE_PATTERNS = [
+  /00_meta\.json$/,
+  /00_research_brief\.md$/,
+  /\d{2}_seed_clues\.json$/,
+  /\d{2}_task_registry\.json$/,
+  /\d{2}_round_summary\.md$/,
+  /\d{2}_delta_report\.json$/,
+  /final_report\.md$/,
+  /tasks\/task_[\w.-]+\.md$/,
+  /tasks\/task_report\.template\.md$/,
+  /audit\.log$/,
+];
+
+const SESSION_SIGNAL_PREFIX = "DEEP_RESEARCH_SESSION ";
+const DEEP_RESEARCH_SESSION_TOOL = "deep_research_session";
+const RESEARCH_DIR_NAME_PATTERN = /(^|\/)(research_\d{8}_[^/]+)(?:\/(.+))?$/;
+
+const EXPLORATORY_TOOL_HINTS = [
+  "search",
+  "fetch",
+  "browser",
+  "web",
+  "http",
+  "shell",
+  "exec",
+  "run",
+  "bash",
+  "python",
+];
+
+const MAINTENANCE_SCRIPT_HINTS = [
+  "check_deep_research_archive.py",
+  "repair_deep_research_archive.py",
+  "init_deep_research_archive.py",
+  "openclaw_deep_research_session.py",
+];
+const TOOL_CALL_BLOCK_TYPES = new Set(["tool_use", "toolcall", "tool_call"]);
+const SUBAGENT_SESSION_SEGMENT = ":subagent:";
+const LEGAL_META_STATUSES = new Set([
+  "initialized",
+  "in_progress",
+  "round_failed",
+  "ready_for_next_round",
+  "ready_for_final_report",
+  "completed",
+]);
+const FINAL_SYNTHESIS_PATTERNS = [
+  /\bfinal[_ -]?report\b/i,
+  /\bfinal synthesis\b/i,
+  /final_report\.md/i,
+  /最终综合/,
+  /最终报告/,
+  /综合报告/,
+];
+const FINAL_REPORT_TEMPLATE = `# 最终研究报告
+
+## 核心结论
+
+- 
+
+## 关键发现与证据来源
+
+- 发现：
+  来源：
+
+## 具体建议
+
+- 
+
+## 局限性与不确定性
+
+-`;
+
+function trimToString(value) {
+  return typeof value === "string" ? value.trim() : "";
+}
+
+function sessionWorkspaceDir(api) {
+  return trimToString(api?.config?.agents?.defaults?.workspace) || process.cwd();
+}
+
+function pluginConfig(api) {
+  return api?.pluginConfig && typeof api.pluginConfig === "object" ? api.pluginConfig : {};
+}
+
+function scriptsDir(api) {
+  const cfg = pluginConfig(api);
+  return (
+    trimToString(cfg.scriptsDir) ||
+    process.env.DEEP_RESEARCH_SCRIPTS ||
+    path.resolve(__dirname, "..", "scripts")
+  );
+}
+
+function repoRoot() {
+  return path.resolve(__dirname, "..");
+}
+
+function isStrictMode(api) {
+  const cfg = pluginConfig(api);
+  if (typeof cfg.strict === "boolean") {
+    return cfg.strict;
+  }
+  return (process.env.DEEP_RESEARCH_STRICT || "1") !== "0";
+}
+
+function readMeta(rdir) {
+  const mp = path.join(rdir, "00_meta.json");
+  if (!fs.existsSync(mp)) return null;
+  try {
+    return JSON.parse(fs.readFileSync(mp, "utf-8"));
+  } catch (_) {
+    return null;
+  }
+}
+
+/**
+ * Run check_deep_research_archive.py and return parsed JSON result.
+ * Returns null on execution error so gating can degrade to heuristic checks.
+ */
+function runChecker(api, rdir, opts = {}) {
+  const checker = path.join(scriptsDir(api), "check_deep_research_archive.py");
+  if (!fs.existsSync(checker)) return null;
+
+  const args = ["--research-dir", rdir];
+  if (opts.strict !== false && isStrictMode(api)) args.push("--strict");
+  if (opts.round != null) args.push("--round", String(opts.round));
+
+  try {
+    execFileSync("python3", [checker, ...args], {
+      timeout: 30_000,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    return { result: "PASS", errors: [] };
+  } catch (err) {
+    const stdout = err.stdout ? err.stdout.toString() : "";
+    try {
+      return JSON.parse(stdout);
+    } catch (_) {
+      return { result: "FAIL", errors: [{ code: "ERR_CHECKER_CRASH", detail: stdout.slice(0, 400) }] };
+    }
+  }
+}
+
+/** Append a line to the audit log inside the research dir. */
+function auditLog(rdir, entry) {
+  if (!rdir) return;
+  const logPath = path.join(rdir, "audit.log");
+  const line = JSON.stringify({ ts: new Date().toISOString(), ...entry }) + "\n";
+  try {
+    fs.appendFileSync(logPath, line);
+  } catch (_) {}
+}
+
+function fileLooksPlaceholder(filePath) {
+  if (!fs.existsSync(filePath)) {
+    return false;
+  }
+  try {
+    const text = fs.readFileSync(filePath, "utf-8");
+    return PLACEHOLDER_PATTERNS.some((pattern) => text.includes(pattern));
+  } catch (_) {
+    return false;
+  }
+}
+
+function isPlaceholderFinalReport(filePath) {
+  if (!fs.existsSync(filePath)) {
+    return true;
+  }
+  try {
+    const text = fs.readFileSync(filePath, "utf-8").trim();
+    return text === FINAL_REPORT_TEMPLATE.trim() || text.includes("replace-with");
+  } catch (_) {
+    return true;
+  }
+}
+
+function safeReadJson(filePath) {
+  try {
+    return JSON.parse(fs.readFileSync(filePath, "utf-8"));
+  } catch (_) {
+    return null;
+  }
+}
+
+function writeJson(filePath, payload) {
+  fs.mkdirSync(path.dirname(filePath), { recursive: true });
+  fs.writeFileSync(filePath, JSON.stringify(payload, null, 2) + "\n", "utf-8");
+}
+
+function makeStage(stage, summary, blockedReason, nextActions, extra = {}) {
+  return {
+    stage,
+    summary,
+    blockedReason,
+    nextActions,
+    ...extra,
+  };
+}
+
+function existingMissingPaths(paths) {
+  return paths.filter((filePath) => !fs.existsSync(filePath));
+}
+
+function anyPlaceholder(paths) {
+  return paths.some((filePath) => fileLooksPlaceholder(filePath));
+}
+
+function listTaskReportPaths(rdir, registryPath) {
+  const registry = safeReadJson(registryPath);
+  const tasks = Array.isArray(registry?.tasks) ? registry.tasks : [];
+  return tasks
+    .map((task) => trimToString(task?.report_path))
+    .filter(Boolean)
+    .map((relPath) => ({
+      relPath,
+      absPath: path.join(rdir, relPath),
+    }));
+}
+
+function resolveRoundPaths(rdir, roundNumber) {
+  const pad = String(roundNumber).padStart(2, "0");
+  const roundDir = path.join(rdir, `round_${pad}`);
+  return {
+    pad,
+    roundDir,
+    seedPath: path.join(roundDir, "01_seed_clues.json"),
+    registryPath: path.join(roundDir, "02_task_registry.json"),
+    summaryPath: path.join(roundDir, "03_round_summary.md"),
+    deltaPath: path.join(roundDir, "04_delta_report.json"),
+  };
+}
+
+function detectArchiveStage(api, rdir, meta) {
+  const currentRound = Number.isInteger(meta?.current_round) ? meta.current_round : 0;
+  if (currentRound <= 0) {
+    return makeStage(
+      "bootstrap",
+      "No round has started yet. Initialize round_01 before exploration.",
+      "Research archive is not yet planned.",
+      [
+        "write 00_research_brief.md if missing",
+        "start round_01 by creating 01_seed_clues.json and 02_task_registry.json",
+      ],
+    );
+  }
+
+  const paths = resolveRoundPaths(rdir, currentRound);
+  const planningPaths = [paths.seedPath, paths.registryPath];
+  const missing = existingMissingPaths(planningPaths).map((filePath) => path.relative(rdir, filePath));
+  if (missing.length > 0) {
+    return makeStage(
+      "plan",
+      `Round ${currentRound} planning is incomplete.`,
+      `Round ${currentRound} prerequisites missing: ${missing.join(", ")}`,
+      [
+        "finish 01_seed_clues.json",
+        "finish 02_task_registry.json",
+      ],
+      { round: currentRound, missing },
+    );
+  }
+
+  if (anyPlaceholder(planningPaths)) {
+    return makeStage(
+      "plan",
+      `Round ${currentRound} planning still contains template placeholders.`,
+      `Round ${currentRound} planning files still contain template placeholders.`,
+      [
+        "replace placeholder seed clues",
+        "replace placeholder task registry fields",
+      ],
+      { round: currentRound },
+    );
+  }
+
+  const taskReports = listTaskReportPaths(rdir, paths.registryPath);
+  const missingReports = taskReports
+    .filter((entry) => !fs.existsSync(entry.absPath))
+    .map((entry) => entry.relPath);
+  const placeholderReports = taskReports
+    .filter((entry) => fileLooksPlaceholder(entry.absPath))
+    .map((entry) => entry.relPath);
+
+  if (taskReports.length === 0 || missingReports.length > 0 || placeholderReports.length > 0) {
+    const blockedReason =
+      missingReports.length > 0
+        ? `Round ${currentRound} still has missing task reports: ${missingReports.join(", ")}`
+        : placeholderReports.length > 0
+          ? `Round ${currentRound} still has placeholder task reports: ${placeholderReports.join(", ")}`
+          : `Round ${currentRound} has no registered task reports yet.`;
+    return makeStage(
+      "execute",
+      `Round ${currentRound} execution is still in progress.`,
+      blockedReason,
+      [
+        "write missing task reports",
+        "replace placeholder task reports with real evidence",
+        "continue exploration tied to registered tasks only",
+      ],
+      { round: currentRound, missingReports, placeholderReports },
+    );
+  }
+
+  const summaryPaths = [paths.summaryPath, paths.deltaPath];
+  const missingSummaryFiles = existingMissingPaths(summaryPaths).map((filePath) =>
+    path.relative(rdir, filePath),
+  );
+  if (missingSummaryFiles.length > 0) {
+    return makeStage(
+      "summarize",
+      `Round ${currentRound} task execution is complete but summary artifacts are missing.`,
+      `Round ${currentRound} summary artifacts missing: ${missingSummaryFiles.join(", ")}`,
+      [
+        "write round summary",
+        "write delta report",
+        "run checker after both files exist",
+      ],
+      { round: currentRound, missing: missingSummaryFiles },
+    );
+  }
+
+  if (anyPlaceholder(summaryPaths)) {
+    return makeStage(
+      "summarize",
+      `Round ${currentRound} summary artifacts still contain template placeholders.`,
+      `Round ${currentRound} summary artifacts still contain template placeholders.`,
+      [
+        "replace placeholder findings, contradictions, and coverage text",
+        "run checker once the round summary is real",
+      ],
+      { round: currentRound },
+    );
+  }
+
+  const checker = runChecker(api, rdir, { round: currentRound });
+  if (checker && checker.result === "FAIL") {
+    return makeStage(
+      "repair",
+      `Round ${currentRound} failed validation and must be repaired before moving on.`,
+      `Round ${currentRound} validation failed: ${(checker.errors || []).map((e) => e.code).join(", ")}`,
+      [
+        "fix only the files named by the checker",
+        "rerun checker",
+        "do not start the next round yet",
+      ],
+      { round: currentRound, errors: checker.errors || [] },
+    );
+  }
+
+  const targetDepth = Number(meta?.target_depth) || 0;
+  if (meta?.depth_mode === "user-specified" && currentRound < targetDepth) {
+    return makeStage(
+      "advance",
+      `Round ${currentRound} is valid. Another round is still required.`,
+      `Current round is valid but research is not complete: ${currentRound}/${targetDepth} rounds done.`,
+      [
+        `start round_${String(currentRound + 1).padStart(2, "0")} by writing new seed clues`,
+        "derive the next round from carry-forward clues",
+      ],
+      { round: currentRound },
+    );
+  }
+
+  const finalReportPath = path.join(rdir, "final_report.md");
+  const finalReportReady = fs.existsSync(finalReportPath) && !isPlaceholderFinalReport(finalReportPath);
+  const metaStatus = trimToString(meta?.status);
+  if (!finalReportReady || metaStatus !== "completed") {
+    return makeStage(
+      "synthesize",
+      "All research rounds are complete. Produce the final synthesis only now.",
+      finalReportReady
+        ? "final_report.md exists, but 00_meta.json is not yet marked completed."
+        : "All rounds are complete, but final_report.md is still missing or placeholder-filled.",
+      [
+        "synthesize findings across all rounds and tasks",
+        "write or refine final_report.md using only completed research evidence",
+        "mark 00_meta.json as completed only after the final report is real",
+      ],
+      { round: currentRound },
+    );
+  }
+
+  return makeStage(
+    "finalize",
+    "Research archive is fully complete and ready for user-facing delivery.",
+    null,
+    [
+      "answer the user from final_report.md",
+      "reference round and task sources in the final answer",
+    ],
+    { round: currentRound },
+  );
+}
+
+function isArchiveTool(api, toolName, params) {
+  if (ARCHIVE_WRITE_TOOLS.has(toolName)) {
+    const target = params?.path || params?.file_path || params?.filename || params?.target || "";
+    return ARCHIVE_FILE_PATTERNS.some(re => re.test(target));
+  }
+  return false;
+}
+
+function extractStructuredWriteText(toolName, params) {
+  if (!params || typeof params !== "object") {
+    return "";
+  }
+  const directKeys = ["content", "text", "data", "new_content", "newText"];
+  for (const key of directKeys) {
+    const value = trimToString(params[key]);
+    if (value) {
+      return value;
+    }
+  }
+  if (toolName === "apply_patch") {
+    return trimToString(params?.patch);
+  }
+  const replacementKeys = ["replacement", "new_str", "replace", "insert"];
+  for (const key of replacementKeys) {
+    const value = trimToString(params[key]);
+    if (value) {
+      return value;
+    }
+  }
+  return "";
+}
+
+function tryParseJsonText(text) {
+  if (!text) {
+    return null;
+  }
+  try {
+    return JSON.parse(text);
+  } catch (_) {
+    return null;
+  }
+}
+
+function collectStringLeaves(value, out = []) {
+  if (typeof value === "string") {
+    out.push(value);
+    return out;
+  }
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      collectStringLeaves(item, out);
+    }
+    return out;
+  }
+  if (value && typeof value === "object") {
+    for (const item of Object.values(value)) {
+      collectStringLeaves(item, out);
+    }
+  }
+  return out;
+}
+
+function sessionSignalLine(payload) {
+  return `${SESSION_SIGNAL_PREFIX}${JSON.stringify(payload)}`;
+}
+
+function sessionToolParametersSchema() {
+  return {
+    type: "object",
+    additionalProperties: false,
+    properties: {
+      action: {
+        type: "string",
+        enum: ["start", "activate", "status", "clear"],
+        description: "Session action to perform.",
+      },
+      topic: {
+        type: "string",
+        description: "Short topic slug for a new research run. Required for action=start.",
+      },
+      question: {
+        type: "string",
+        description: "Original user question. Required for action=start.",
+      },
+      target_depth: {
+        type: "integer",
+        minimum: 1,
+        description: "Required research depth/round count. Required for action=start.",
+      },
+      depth_mode: {
+        type: "string",
+        enum: ["auto", "user-specified"],
+        description: "Depth resolution mode for action=start. Defaults to auto.",
+      },
+      research_dir_name: {
+        type: "string",
+        description: "Optional archive directory name override for action=start.",
+      },
+      research_dir: {
+        type: "string",
+        description: "Absolute research directory path. Required for action=activate.",
+      },
+      no_check: {
+        type: "boolean",
+        description: "Skip validator after init for action=start.",
+      },
+    },
+    required: ["action"],
+  };
+}
+
+function sessionToolArgs(rawParams, api) {
+  const action = trimToString(rawParams?.action);
+  const workspaceDir = sessionWorkspaceDir(api);
+  if (!action) {
+    throw new Error("deep_research_session requires action");
+  }
+
+  const args = [action, "--workspace-dir", workspaceDir];
+  if (action === "start") {
+    const topic = trimToString(rawParams?.topic);
+    const question = trimToString(rawParams?.question);
+    const targetDepth = Number(rawParams?.target_depth);
+    const depthMode = trimToString(rawParams?.depth_mode) || "auto";
+    const researchDirName = trimToString(rawParams?.research_dir_name);
+    if (!topic) {
+      throw new Error("deep_research_session(start) requires topic");
+    }
+    if (!question) {
+      throw new Error("deep_research_session(start) requires question");
+    }
+    if (!Number.isInteger(targetDepth) || targetDepth <= 0) {
+      throw new Error("deep_research_session(start) requires target_depth > 0");
+    }
+    args.push(
+      "--topic",
+      topic,
+      "--question",
+      question,
+      "--target-depth",
+      String(targetDepth),
+      "--depth-mode",
+      depthMode,
+      "--output-root",
+      workspaceDir,
+    );
+    if (researchDirName) {
+      args.push("--research-dir-name", researchDirName);
+    }
+    if (rawParams?.no_check === true) {
+      args.push("--no-check");
+    }
+    return args;
+  }
+
+  if (action === "activate") {
+    const researchDir = trimToString(rawParams?.research_dir);
+    if (!researchDir) {
+      throw new Error("deep_research_session(activate) requires research_dir");
+    }
+    args.push("--research-dir", researchDir);
+    return args;
+  }
+
+  if (action === "status" || action === "clear") {
+    return args;
+  }
+
+  throw new Error(`Unsupported deep_research_session action: ${action}`);
+}
+
+function formatExecError(err) {
+  const stderr = err?.stderr ? err.stderr.toString().trim() : "";
+  const stdout = err?.stdout ? err.stdout.toString().trim() : "";
+  const detail = stderr || stdout || trimToString(err?.message) || "unknown error";
+  return detail;
+}
+
+function runDeepResearchSession(api, rawParams) {
+  const script = path.join(scriptsDir(api), "openclaw_deep_research_session.py");
+  if (!fs.existsSync(script)) {
+    throw new Error(`session script not found: ${script}`);
+  }
+
+  const args = sessionToolArgs(rawParams, api);
+  let stdout;
+  try {
+    stdout = execFileSync("python3", [script, ...args], {
+      cwd: sessionWorkspaceDir(api),
+      stdio: ["ignore", "pipe", "pipe"],
+    }).toString();
+  } catch (err) {
+    throw new Error(formatExecError(err));
+  }
+
+  const payload = parseSessionSignal(stdout);
+  if (!payload) {
+    throw new Error("session script did not emit DEEP_RESEARCH_SESSION payload");
+  }
+  return {
+    ok: true,
+    action: payload.action,
+    session: payload,
+    signal: sessionSignalLine(payload),
+  };
+}
+
+function createDeepResearchSessionTool(api) {
+  return {
+    name: DEEP_RESEARCH_SESSION_TOOL,
+    label: "Deep Research Session",
+    description:
+      "Start, activate, inspect, or clear the active OpenClaw deep-research session. Use this before writing any research_* archive files.",
+    parameters: sessionToolParametersSchema(),
+    execute: async (_toolCallId, rawParams) => runDeepResearchSession(api, rawParams),
+  };
+}
+
+function sessionCacheKey(ctx) {
+  return trimToString(ctx?.sessionKey) || trimToString(ctx?.sessionId) || trimToString(ctx?.agentId) || null;
+}
+
+function sessionRole(ctx) {
+  const sessionKey = trimToString(ctx?.sessionKey).toLowerCase();
+  if (sessionKey.includes(SUBAGENT_SESSION_SEGMENT)) {
+    return "worker";
+  }
+  return "orchestrator";
+}
+
+function workspaceDirFromCtx(ctx) {
+  return trimToString(ctx?.workspaceDir) || "";
+}
+
+function activeSessionFile(ctx) {
+  const workspaceDir = workspaceDirFromCtx(ctx);
+  if (!workspaceDir) return null;
+  return path.join(workspaceDir, ".deep-research", "active.json");
+}
+
+function normalizeWorkerSessionKeys(value) {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+  return [...new Set(value.map((entry) => trimToString(entry)).filter(Boolean))];
+}
+
+function makeCachedSession(session) {
+  const previous =
+    session?.previous && typeof session.previous === "object" ? session.previous : null;
+  if (!session?.researchDir) {
+    return null;
+  }
+  const next = session && typeof session === "object" ? { ...session } : {};
+  delete next.previous;
+  return {
+    ...(previous || {}),
+    ...next,
+    marker: session.marker || null,
+    researchDir: session.researchDir,
+  };
+}
+
+function getCachedSessionState(key) {
+  const cached = ACTIVE_SESSIONS.get(key);
+  if (!cached || typeof cached !== "object") {
+    return null;
+  }
+  const researchDir = trimToString(cached.researchDir);
+  if (!researchDir) {
+    return null;
+  }
+  return {
+    ...cached,
+    marker: trimToString(cached.marker) || null,
+    researchDir,
+  };
+}
+
+function getCachedSession(key) {
+  const cached = getCachedSessionState(key);
+  if (!cached) {
+    return null;
+  }
+  return {
+    marker: cached.marker,
+    researchDir: cached.researchDir,
+  };
+}
+
+function cacheSession(key, session) {
+  const previous = getCachedSessionState(key);
+  const cached = makeCachedSession({ ...session, previous });
+  if (!key || !cached) {
+    return;
+  }
+  ACTIVE_SESSIONS.set(key, cached);
+}
+
+function updateCachedSession(key, mutate) {
+  if (!key || typeof mutate !== "function") {
+    return null;
+  }
+  const current = getCachedSessionState(key);
+  if (!current) {
+    return null;
+  }
+  const next = mutate(current);
+  if (!next || typeof next !== "object") {
+    return null;
+  }
+  const cached = makeCachedSession({
+    ...next,
+    previous: current,
+    marker: trimToString(next.marker) || current.marker,
+    researchDir: trimToString(next.researchDir) || current.researchDir,
+  });
+  if (!cached) {
+    return null;
+  }
+  ACTIVE_SESSIONS.set(key, cached);
+  return cached;
+}
+
+function updateActiveSessionMarker(marker, mutate) {
+  if (!marker || typeof mutate !== "function") {
+    return null;
+  }
+  const payload = safeReadJson(marker);
+  if (!payload || typeof payload !== "object") {
+    return null;
+  }
+  const nextPayload = mutate(payload);
+  if (!nextPayload || typeof nextPayload !== "object") {
+    return null;
+  }
+  const researchDir = trimToString(nextPayload.research_dir);
+  if (!researchDir) {
+    return null;
+  }
+  writeJson(marker, nextPayload);
+  return {
+    marker,
+    payload: nextPayload,
+    researchDir,
+  };
+}
+
+function sessionOwnsResearch(payload, ctx) {
+  const ownerSessionId = trimToString(payload?.owner_session_id);
+  const currentSessionId = trimToString(ctx?.sessionId);
+  if (!ownerSessionId || !currentSessionId) {
+    return false;
+  }
+  return ownerSessionId === currentSessionId;
+}
+
+function workerCanAccessResearch(payload, ctx) {
+  const sessionKey = trimToString(ctx?.sessionKey);
+  if (!sessionKey) {
+    return false;
+  }
+  const workerKeys = normalizeWorkerSessionKeys(payload?.worker_session_keys);
+  return workerKeys.includes(sessionKey);
+}
+
+function sessionMatchesActiveResearch(payload, ctx) {
+  if (sessionRole(ctx) === "worker") {
+    return workerCanAccessResearch(payload, ctx);
+  }
+  return sessionOwnsResearch(payload, ctx);
+}
+
+function rebindOwnedActiveSession(ctx, signal) {
+  const workspaceDir = trimToString(signal?.workspace_dir) || workspaceDirFromCtx(ctx);
+  const researchDir = trimToString(signal?.research_dir);
+  if (!workspaceDir || !researchDir) {
+    return null;
+  }
+
+  const marker = path.join(workspaceDir, ".deep-research", "active.json");
+  const rebound = updateActiveSessionMarker(marker, (payload) => ({
+    ...payload,
+    version: Math.max(Number(payload?.version) || 1, 2),
+    workspace_dir: trimToString(payload?.workspace_dir) || workspaceDir,
+    research_dir: researchDir,
+    owner_session_id: trimToString(ctx?.sessionId),
+    owner_session_key: trimToString(ctx?.sessionKey) || undefined,
+    worker_session_keys: [],
+    activated_at: trimToString(signal?.activated_at) || trimToString(payload?.activated_at) || new Date().toISOString(),
+  }));
+
+  if (!rebound) {
+    return null;
+  }
+  cacheSession(sessionCacheKey(ctx), rebound);
+  return rebound;
+}
+
+function linkWorkerSession(requesterSessionKey, childSessionKey) {
+  const requesterKey = trimToString(requesterSessionKey);
+  const childKey = trimToString(childSessionKey);
+  if (!requesterKey || !childKey) {
+    return null;
+  }
+
+  const requesterSession = getCachedSession(requesterKey);
+  const marker = requesterSession?.marker;
+  if (!marker) {
+    return null;
+  }
+
+  const linked = updateActiveSessionMarker(marker, (payload) => {
+    const ownerSessionKey = trimToString(payload?.owner_session_key);
+    const workerKeys = new Set(normalizeWorkerSessionKeys(payload?.worker_session_keys));
+    if (requesterKey !== ownerSessionKey && !workerKeys.has(requesterKey)) {
+      return null;
+    }
+    workerKeys.add(childKey);
+    return {
+      ...payload,
+      version: Math.max(Number(payload?.version) || 1, 2),
+      worker_session_keys: [...workerKeys],
+    };
+  });
+
+  if (!linked) {
+    return null;
+  }
+  cacheSession(childKey, linked);
+  return linked;
+}
+
+function unlinkWorkerSession(targetSessionKey) {
+  const targetKey = trimToString(targetSessionKey);
+  if (!targetKey) {
+    return null;
+  }
+
+  const targetSession = getCachedSession(targetKey);
+  const marker = targetSession?.marker;
+  ACTIVE_SESSIONS.delete(targetKey);
+  if (!marker) {
+    return null;
+  }
+
+  return updateActiveSessionMarker(marker, (payload) => ({
+    ...payload,
+    version: Math.max(Number(payload?.version) || 1, 2),
+    worker_session_keys: normalizeWorkerSessionKeys(payload?.worker_session_keys).filter((key) => key !== targetKey),
+  }));
+}
+
+function readActiveSession(ctx) {
+  const marker = activeSessionFile(ctx);
+  if (!marker || !fs.existsSync(marker)) return null;
+  try {
+    const payload = JSON.parse(fs.readFileSync(marker, "utf-8"));
+    if (!payload || typeof payload !== "object") return null;
+    const rdir = trimToString(payload.research_dir);
+    if (!rdir) return null;
+    return {
+      marker,
+      payload,
+      researchDir: rdir,
+    };
+  } catch (_) {
+    return null;
+  }
+}
+
+function activeResearchDir(ctx) {
+  const key = sessionCacheKey(ctx);
+  const session = readActiveSession(ctx);
+  if (session) {
+    if (sessionMatchesActiveResearch(session.payload, ctx)) {
+      cacheSession(key, session);
+      return session.researchDir;
+    }
+    if (key) ACTIVE_SESSIONS.delete(key);
+    return null;
+  }
+  if (workspaceDirFromCtx(ctx)) {
+    if (key) ACTIVE_SESSIONS.delete(key);
+    return null;
+  }
+  if (key) {
+    return getCachedSession(key)?.researchDir || null;
+  }
+  return null;
+}
+
+function bindActiveResearch(ctx, researchDir, marker = null) {
+  const key = sessionCacheKey(ctx);
+  if (!key) return;
+  if (researchDir) {
+    cacheSession(key, { researchDir, marker });
+    return;
+  }
+  ACTIVE_SESSIONS.delete(key);
+}
+
+function parseSessionSignal(value) {
+  const lines = collectStringLeaves(value)
+    .flatMap((text) => String(text).split("\n"))
+    .map((line) => line.trim())
+    .filter(Boolean);
+
+  const raw = lines.find((line) => line.startsWith(SESSION_SIGNAL_PREFIX));
+  if (!raw) return null;
+  try {
+    const payload = JSON.parse(raw.slice(SESSION_SIGNAL_PREFIX.length));
+    if (!payload || typeof payload !== "object") return null;
+    return payload;
+  } catch (_) {
+    return null;
+  }
+}
+
+function resolveWriteTarget(target, workspaceDir = "") {
+  const raw = trimToString(target).replace(/\\/g, "/");
+  if (!raw) {
+    return "";
+  }
+  if (path.isAbsolute(raw)) {
+    return path.resolve(raw).replace(/\\/g, "/");
+  }
+  if (!workspaceDir) {
+    return raw;
+  }
+  return path.resolve(workspaceDir, raw).replace(/\\/g, "/");
+}
+
+function parseArchiveTarget(target, workspaceDir = "") {
+  const resolved = resolveWriteTarget(target, workspaceDir);
+  if (!resolved) {
+    return null;
+  }
+  const match = resolved.match(RESEARCH_DIR_NAME_PATTERN);
+  if (!match) {
+    return null;
+  }
+  const relPath = trimToString(match[3]);
+  if (!relPath) {
+    return null;
+  }
+  if (!ARCHIVE_FILE_PATTERNS.some((pattern) => pattern.test(relPath))) {
+    return null;
+  }
+  return {
+    absPath: resolved,
+    researchDir: resolved.slice(0, resolved.length - relPath.length - 1),
+    relPath,
+  };
+}
+
+function validateInactiveArchiveBootstrap(toolName, params, workspaceDir = "") {
+  const targets = extractWriteTargets(toolName, params);
+  for (const target of targets) {
+    const archiveTarget = parseArchiveTarget(target, workspaceDir);
+    if (!archiveTarget) {
+      continue;
+    }
+    return {
+      ok: false,
+      reason:
+        `[deep-research-guard] Cannot write ${archiveTarget.relPath} under ${archiveTarget.researchDir} ` +
+        `without an active deep-research session. Call ${DEEP_RESEARCH_SESSION_TOOL} with action=start or action=activate first.`,
+    };
+  }
+  return { ok: true };
+}
+
+function isMaintenanceTool(params) {
+  const leaves = collectStringLeaves(params).map((text) => text.toLowerCase());
+  return MAINTENANCE_SCRIPT_HINTS.some((hint) =>
+    leaves.some((text) => text.includes(hint.toLowerCase())),
+  );
+}
+
+function isExploratoryTool(toolName, params) {
+  const normalized = trimToString(toolName).toLowerCase();
+  if (!normalized) {
+    return false;
+  }
+  if (isMaintenanceTool(params)) {
+    return false;
+  }
+  return EXPLORATORY_TOOL_HINTS.some((hint) => normalized.includes(hint));
+}
+
+function buildStagePrompt(stageInfo, meta) {
+  const lines = [
+    "Deep-research guard is active.",
+    "Schema authority lives in templates/ and scripts/, not memory or prior runs.",
+    `Current stage: ${stageInfo.stage}.`,
+    stageInfo.summary,
+  ];
+  if (meta && Number.isInteger(meta.current_round)) {
+    lines.push(
+      `Meta status: current_round=${meta.current_round}, target_depth=${meta.target_depth}, status=${meta.status}.`,
+    );
+  }
+  if (Array.isArray(stageInfo.nextActions) && stageInfo.nextActions.length > 0) {
+    lines.push("Next actions:");
+    for (const action of stageInfo.nextActions) {
+      lines.push(`- ${action}`);
+    }
+  }
+  if (stageInfo.stage !== "finalize") {
+    lines.push(
+      "Do not declare the research complete unless the archive state reaches finalize.",
+    );
+  }
+  return lines.join("\n");
+}
+
+function buildWorkerPrompt(stageInfo, meta) {
+  const lines = [
+    "Deep-research task-worker guard is active.",
+    "You are a subagent helping an active deep-research session.",
+    "Schema authority lives in templates/ and scripts/, not memory or prior runs.",
+    `Coordinator stage: ${stageInfo.stage}.`,
+    stageInfo.summary,
+    "Your job is to complete only the assigned task and hand control back to the requester.",
+    "Allowed archive writes: only registered round task reports under round_N/tasks/.",
+    "Forbidden archive writes: 00_meta.json, seed clues, task registry, round summary, delta report, final_report.md.",
+    "Do not advance rounds, rewrite the task registry, or declare the full research complete.",
+  ];
+  if (meta && Number.isInteger(meta.current_round)) {
+    lines.push(
+      `Coordinator status: current_round=${meta.current_round}, target_depth=${meta.target_depth}, status=${meta.status}.`,
+    );
+  }
+  return lines.join("\n");
+}
+
+function normalizeType(value) {
+  return typeof value === "string" ? value.trim().toLowerCase() : "";
+}
+
+function isAssistantMessage(message) {
+  return trimToString(message?.role).toLowerCase() === "assistant";
+}
+
+function hasToolCall(message) {
+  const directToolName = trimToString(message?.toolName || message?.tool_name);
+  if (directToolName) {
+    return true;
+  }
+  const content = message?.content;
+  if (!Array.isArray(content)) {
+    return false;
+  }
+  return content.some((entry) => TOOL_CALL_BLOCK_TYPES.has(normalizeType(entry?.type)));
+}
+
+function isTerminalAssistantMessage(message) {
+  if (!isAssistantMessage(message)) {
+    return false;
+  }
+  const stopReason = trimToString(message?.stopReason).toLowerCase();
+  if (stopReason === "error" || stopReason === "aborted") {
+    return false;
+  }
+  return !hasToolCall(message);
+}
+
+function buildContinuationEvent(stageInfo, meta) {
+  const lines = [
+    `Deep-research guard blocked an attempted stop because the archive is still at stage ${stageInfo.stage}.`,
+  ];
+  if (stageInfo.blockedReason) {
+    lines.push(stageInfo.blockedReason);
+  } else if (stageInfo.summary) {
+    lines.push(stageInfo.summary);
+  }
+  if (meta && Number.isInteger(meta.current_round)) {
+    lines.push(`Current round: ${meta.current_round}.`);
+  }
+  if (Array.isArray(stageInfo.nextActions) && stageInfo.nextActions.length > 0) {
+    lines.push(`Continue with: ${stageInfo.nextActions.join("; ")}.`);
+  }
+  lines.push("Use tools as needed. Do not stop until the archive reaches finalize.");
+  return lines.join(" ");
+}
+
+function queueContinuationWake(api, ctx, text, contextKey, reason = "wake") {
+  const sessionKey = trimToString(ctx?.sessionKey);
+  const agentId = trimToString(ctx?.agentId);
+  let queued = false;
+  try {
+    const runtimeSystem = api?.runtime?.system;
+    if (runtimeSystem?.enqueueSystemEvent && sessionKey) {
+      runtimeSystem.enqueueSystemEvent(text, { sessionKey, contextKey });
+      queued = true;
+    }
+    if (runtimeSystem?.requestHeartbeatNow && (sessionKey || agentId)) {
+      runtimeSystem.requestHeartbeatNow({
+        reason,
+        ...(sessionKey ? { sessionKey } : {}),
+        ...(agentId ? { agentId } : {}),
+      });
+      queued = true;
+    }
+  } catch (_) {}
+  return queued;
+}
+
+function clearPendingToolContinuation(ctx) {
+  if (sessionRole(ctx) !== "orchestrator") {
+    return null;
+  }
+  const key = sessionCacheKey(ctx);
+  return updateCachedSession(key, (current) => ({
+    ...current,
+    pendingToolContinuation: false,
+  }));
+}
+
+function markToolActivity(ctx, event) {
+  if (sessionRole(ctx) !== "orchestrator") {
+    return null;
+  }
+  const toolName = trimToString(event?.toolName);
+  if (!toolName || toolName === "sessions_yield") {
+    return null;
+  }
+  const key = sessionCacheKey(ctx);
+  return updateCachedSession(key, (current) => ({
+    ...current,
+    pendingToolContinuation: true,
+    lastToolName: toolName,
+    lastToolCallId: trimToString(event?.toolCallId) || null,
+    lastToolAt: Date.now(),
+  }));
+}
+
+function maybeResumeUnfinishedResearch(api, ctx, rdir, meta, stageInfo, message) {
+  if (!rdir || !stageInfo || stageInfo.stage === "finalize") {
+    return null;
+  }
+  if (sessionRole(ctx) !== "orchestrator") {
+    return null;
+  }
+  if (!isTerminalAssistantMessage(message)) {
+    return null;
+  }
+
+  const continuationEvent = buildContinuationEvent(stageInfo, meta);
+  const contextKey = [
+    "deep-research-stop-guard",
+    stageInfo.stage,
+    Number.isInteger(meta?.current_round) ? meta.current_round : "na",
+  ].join(":");
+
+  queueContinuationWake(api, ctx, continuationEvent, contextKey, "wake");
+  updateCachedSession(sessionCacheKey(ctx), (current) => ({
+    ...current,
+    pendingToolContinuation: false,
+    lastContinuationKey: contextKey,
+    lastContinuationAt: Date.now(),
+  }));
+
+  auditLog(rdir, {
+    hook: "before_message_write",
+    action: "BLOCK_STOP",
+    stage: stageInfo.stage,
+    round: meta?.current_round,
+    stopReason: trimToString(message?.stopReason) || null,
+  });
+
+  return {
+    block: true,
+    reason: continuationEvent,
+  };
+}
+
+function buildPostToolContinuationEvent(stageInfo, meta, cached) {
+  const toolName = trimToString(cached?.lastToolName) || "a tool";
+  const lines = [
+    `Deep-research guard detected that the run went idle immediately after ${toolName} completed.`,
+    `The archive is still at stage ${stageInfo.stage}, so the research must continue.`,
+  ];
+  if (stageInfo.blockedReason) {
+    lines.push(stageInfo.blockedReason);
+  } else if (stageInfo.summary) {
+    lines.push(stageInfo.summary);
+  }
+  if (meta && Number.isInteger(meta.current_round)) {
+    lines.push(`Current round: ${meta.current_round}.`);
+  }
+  if (Array.isArray(stageInfo.nextActions) && stageInfo.nextActions.length > 0) {
+    lines.push(`Continue with: ${stageInfo.nextActions.join("; ")}.`);
+  }
+  lines.push("Use the latest tool results, take the next required step, and do not stop until the archive reaches finalize.");
+  return lines.join(" ");
+}
+
+function maybeResumeAfterToolIdle(api, ctx, rdir, meta, stageInfo, event) {
+  if (!rdir || !stageInfo || stageInfo.stage === "finalize") {
+    return null;
+  }
+  if (sessionRole(ctx) !== "orchestrator") {
+    return null;
+  }
+  if (event?.success === false || trimToString(event?.error)) {
+    return null;
+  }
+
+  const key = sessionCacheKey(ctx);
+  const cached = getCachedSessionState(key);
+  if (!cached?.pendingToolContinuation || !trimToString(cached?.lastToolCallId)) {
+    return null;
+  }
+
+  const contextKey = [
+    "deep-research-post-tool",
+    stageInfo.stage,
+    Number.isInteger(meta?.current_round) ? meta.current_round : "na",
+    trimToString(cached.lastToolCallId),
+  ].join(":");
+  if (trimToString(cached.lastContinuationKey) === contextKey) {
+    return null;
+  }
+
+  const continuationEvent = buildPostToolContinuationEvent(stageInfo, meta, cached);
+  queueContinuationWake(api, ctx, continuationEvent, contextKey, "deep-research-post-tool");
+  updateCachedSession(key, (current) => ({
+    ...current,
+    pendingToolContinuation: false,
+    lastContinuationKey: contextKey,
+    lastContinuationAt: Date.now(),
+  }));
+
+  auditLog(rdir, {
+    hook: "agent_end",
+    action: "AUTO_RESUME",
+    trigger: "post_tool_idle",
+    stage: stageInfo.stage,
+    round: meta?.current_round,
+    tool: trimToString(cached.lastToolName) || null,
+    toolCallId: trimToString(cached.lastToolCallId) || null,
+  });
+  return {
+    queued: true,
+    contextKey,
+    reason: continuationEvent,
+  };
+}
+
+function extractApplyPatchTargets(patchText) {
+  if (typeof patchText !== "string" || !patchText) {
+    return [];
+  }
+  const matches = [];
+  const patterns = [
+    /^\*\*\* Add File:\s+(.+)$/gm,
+    /^\*\*\* Update File:\s+(.+)$/gm,
+    /^\*\*\* Delete File:\s+(.+)$/gm,
+    /^\*\*\* Move to:\s+(.+)$/gm,
+  ];
+  for (const pattern of patterns) {
+    let match;
+    while ((match = pattern.exec(patchText)) !== null) {
+      matches.push(match[1].trim());
+    }
+  }
+  return matches;
+}
+
+function extractWriteTargets(toolName, params) {
+  if (!ARCHIVE_WRITE_TOOLS.has(toolName)) {
+    return [];
+  }
+  const keys = ["path", "file_path", "filename", "target"];
+  const targets = [];
+  for (const key of keys) {
+    const value = trimToString(params?.[key]);
+    if (value) {
+      targets.push(value);
+    }
+  }
+  if (toolName === "apply_patch") {
+    targets.push(...extractApplyPatchTargets(params?.patch));
+  }
+  return [...new Set(targets.map((target) => target.replace(/\\/g, "/")))];
+}
+
+function allowedTaskReportTargets(rdir, meta) {
+  if (!rdir || !Number.isInteger(meta?.current_round) || meta.current_round <= 0) {
+    return [];
+  }
+  const { registryPath } = resolveRoundPaths(rdir, meta.current_round);
+  return listTaskReportPaths(rdir, registryPath).map((entry) => entry.relPath.replace(/\\/g, "/"));
+}
+
+function validateWorkerArchiveWrite(toolName, params, rdir, meta) {
+  const targets = extractWriteTargets(toolName, params);
+  if (targets.length === 0) {
+    return { ok: true };
+  }
+
+  const allowedTargets = new Set(allowedTaskReportTargets(rdir, meta));
+  const disallowed = targets.filter((target) => {
+    const normalized = target.replace(/\\/g, "/");
+    const looksLikeArchiveTarget = ARCHIVE_FILE_PATTERNS.some((pattern) => pattern.test(normalized));
+    if (!looksLikeArchiveTarget) {
+      return false;
+    }
+    if (allowedTargets.size === 0) {
+      return true;
+    }
+    for (const allowed of allowedTargets) {
+      if (normalized === allowed || normalized.endsWith(`/${allowed}`)) {
+        return false;
+      }
+    }
+    return true;
+  });
+
+  if (disallowed.length === 0) {
+    return { ok: true };
+  }
+
+  return {
+    ok: false,
+    reason:
+      "[deep-research-guard] Subagent task workers may only write registered task reports under the current round tasks/ directory. " +
+      `Blocked targets: ${disallowed.join(", ")}`,
+  };
+}
+
+function extractStatusStrings(text) {
+  if (!text) {
+    return [];
+  }
+  const matches = [];
+  const pattern = /"status"\s*:\s*"([^"\n]+)"/g;
+  let match;
+  while ((match = pattern.exec(text)) !== null) {
+    matches.push(match[1].trim());
+  }
+  return [...new Set(matches.filter(Boolean))];
+}
+
+function validateMetaWrite(toolName, params, target, meta) {
+  if (!/00_meta\.json$/.test(target)) {
+    return { ok: true };
+  }
+
+  const text = extractStructuredWriteText(toolName, params);
+  const parsed = tryParseJsonText(text);
+  if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+    const status = trimToString(parsed.status);
+    if (status && !LEGAL_META_STATUSES.has(status)) {
+      return {
+        ok: false,
+        reason:
+          `[deep-research-guard] 00_meta.json status "${status}" is invalid. ` +
+          `Use only: ${[...LEGAL_META_STATUSES].join(", ")}.`,
+      };
+    }
+
+    const currentRound = Number(parsed.current_round);
+    const targetDepth = Number(parsed.target_depth);
+    if (
+      Number.isFinite(currentRound) &&
+      Number.isFinite(targetDepth) &&
+      status === "ready_for_final_report" &&
+      currentRound < targetDepth
+    ) {
+      return {
+        ok: false,
+        reason:
+          `[deep-research-guard] 00_meta.json cannot enter ready_for_final_report at ${currentRound}/${targetDepth} rounds.`,
+      };
+    }
+    if (
+      Number.isFinite(currentRound) &&
+      Number.isFinite(targetDepth) &&
+      status === "completed" &&
+      currentRound < targetDepth
+    ) {
+      return {
+        ok: false,
+        reason:
+          `[deep-research-guard] 00_meta.json cannot enter completed at ${currentRound}/${targetDepth} rounds.`,
+      };
+    }
+    if (
+      Number.isFinite(currentRound) &&
+      Number.isFinite(targetDepth) &&
+      status === "ready_for_next_round" &&
+      currentRound >= targetDepth
+    ) {
+      return {
+        ok: false,
+        reason:
+          `[deep-research-guard] 00_meta.json cannot stay ready_for_next_round when current_round=${currentRound} already reached target_depth=${targetDepth}.`,
+      };
+    }
+    return { ok: true };
+  }
+
+  const statuses = extractStatusStrings(text);
+  const invalid = statuses.find((status) => !LEGAL_META_STATUSES.has(status));
+  if (!invalid) {
+    return { ok: true };
+  }
+  return {
+    ok: false,
+    reason:
+      `[deep-research-guard] 00_meta.json status "${invalid}" is invalid. ` +
+      `Use only: ${[...LEGAL_META_STATUSES].join(", ")}.`,
+  };
+}
+
+function taskLooksLikeFinalSynthesis(task) {
+  const fields = [
+    task?.title,
+    task?.key_question,
+    task?.report_path,
+    ...(Array.isArray(task?.expected_evidence) ? task.expected_evidence : []),
+  ]
+    .map((value) => trimToString(value))
+    .filter(Boolean);
+  const haystack = fields.join("\n");
+  return FINAL_SYNTHESIS_PATTERNS.some((pattern) => pattern.test(haystack));
+}
+
+function extractRoundNumberFromTarget(target, fileName) {
+  const escaped = fileName.replace(".", "\\.");
+  const match = String(target).replace(/\\/g, "/").match(new RegExp(`round_(\\d+)/${escaped}$`));
+  if (!match) {
+    return null;
+  }
+  return Number(match[1]);
+}
+
+function validateFinalRoundRegistryWrite(toolName, params, target, meta) {
+  if (!/02_task_registry\.json$/.test(target)) {
+    return { ok: true };
+  }
+
+  const targetRound = extractRoundNumberFromTarget(target, "02_task_registry.json");
+  const targetDepth = Number(meta?.target_depth) || 0;
+  if (!targetRound || !targetDepth || targetRound !== targetDepth) {
+    return { ok: true };
+  }
+
+  const text = extractStructuredWriteText(toolName, params);
+  const parsed = tryParseJsonText(text);
+  if (parsed && typeof parsed === "object" && Array.isArray(parsed.tasks)) {
+    const offendingTask = parsed.tasks.find((task) => taskLooksLikeFinalSynthesis(task));
+    if (!offendingTask) {
+      return { ok: true };
+    }
+    return {
+      ok: false,
+      reason:
+        `[deep-research-guard] round_${String(targetRound).padStart(2, "0")}/02_task_registry.json ` +
+        "cannot contain final synthesis or final report tasks. The last round is still a normal exploration round.",
+    };
+  }
+
+  if (!text || !FINAL_SYNTHESIS_PATTERNS.some((pattern) => pattern.test(text))) {
+    return { ok: true };
+  }
+  return {
+    ok: false,
+    reason:
+      `[deep-research-guard] round_${String(targetRound).padStart(2, "0")}/02_task_registry.json ` +
+      "cannot contain final synthesis or final report tasks. The last round is still a normal exploration round.",
+  };
+}
+
+function validateFinalReportWrite(target, stageInfo) {
+  if (!/final_report\.md$/.test(target)) {
+    return { ok: true };
+  }
+  if (stageInfo.stage === "synthesize" || stageInfo.stage === "finalize") {
+    return { ok: true };
+  }
+  return {
+    ok: false,
+    reason:
+      `[deep-research-guard] final_report.md can only be written during the independent final synthesis stage. Current stage: ${stageInfo.stage}.`,
+  };
+}
+
+function validateArchiveWrite(toolName, params, rdir, meta, stageInfo) {
+  const targets = extractWriteTargets(toolName, params);
+  for (const target of targets) {
+    const normalized = target.replace(/\\/g, "/");
+    if (!ARCHIVE_FILE_PATTERNS.some((pattern) => pattern.test(normalized))) {
+      continue;
+    }
+
+    const metaWrite = validateMetaWrite(toolName, params, normalized, meta);
+    if (!metaWrite.ok) {
+      return metaWrite;
+    }
+
+    const registryWrite = validateFinalRoundRegistryWrite(toolName, params, normalized, meta);
+    if (!registryWrite.ok) {
+      return registryWrite;
+    }
+
+    const finalReportWrite = validateFinalReportWrite(normalized, stageInfo);
+    if (!finalReportWrite.ok) {
+      return finalReportWrite;
+    }
+  }
+  return { ok: true };
+}
+
+function shouldBlockToolForStage(stageInfo, toolName, params) {
+  if (!isExploratoryTool(toolName, params)) {
+    return false;
+  }
+  return stageInfo.stage !== "execute" && stageInfo.stage !== "finalize";
+}
+
+function register(api) {
+  if (typeof api.registerTool === "function") {
+    api.registerTool(createDeepResearchSessionTool(api));
+  }
+
+  api.on("before_prompt_build", async (_event, ctx) => {
+    const rdir = activeResearchDir(ctx);
+    if (!rdir) {
+      bindActiveResearch(ctx, null);
+      return {};
+    }
+    bindActiveResearch(ctx, rdir);
+
+    const meta = readMeta(rdir);
+    if (!meta) {
+      return {
+        prependContext:
+          "Deep-research session is active, but 00_meta.json is missing or unreadable. Repair or reinitialize the active archive before broad exploration.",
+      };
+    }
+
+    const stageInfo = detectArchiveStage(api, rdir, meta);
+    auditLog(rdir, {
+      hook: "before_prompt_build",
+      role: sessionRole(ctx),
+      stage: stageInfo.stage,
+      round: meta.current_round,
+    });
+    return {
+      prependContext:
+        sessionRole(ctx) === "worker"
+          ? buildWorkerPrompt(stageInfo, meta)
+          : buildStagePrompt(stageInfo, meta),
+    };
+  });
+
+  api.on("before_tool_call", async (event, ctx) => {
+    const inactiveBootstrap = validateInactiveArchiveBootstrap(
+      event.toolName,
+      event.params,
+      workspaceDirFromCtx(ctx),
+    );
+    const rdir = activeResearchDir(ctx);
+    if (!rdir) {
+      bindActiveResearch(ctx, null);
+      if (!inactiveBootstrap.ok) {
+        return { block: true, blockReason: inactiveBootstrap.reason };
+      }
+      return {};
+    }
+    bindActiveResearch(ctx, rdir);
+
+    const meta = readMeta(rdir);
+    if (!meta) {
+      if (!isExploratoryTool(event.toolName, event.params)) {
+        return {};
+      }
+      const reason =
+        "[deep-research-guard] 00_meta.json is missing or unreadable. Initialize the research archive before using exploratory tools.";
+      auditLog(rdir, { hook: "before_tool_call", action: "BLOCK", tool: event.toolName, reason });
+      return { block: true, blockReason: reason };
+    }
+
+    const { toolName, params } = event;
+
+    if (sessionRole(ctx) === "worker") {
+      const workerWrite = validateWorkerArchiveWrite(toolName, params, rdir, meta);
+      if (!workerWrite.ok) {
+        auditLog(rdir, {
+          hook: "before_tool_call",
+          role: "worker",
+          action: "BLOCK",
+          tool: toolName,
+          reason: workerWrite.reason,
+        });
+        return { block: true, blockReason: workerWrite.reason };
+      }
+    }
+
+    const stageInfo = detectArchiveStage(api, rdir, meta);
+    const archiveWrite = validateArchiveWrite(toolName, params, rdir, meta, stageInfo);
+    if (!archiveWrite.ok) {
+      auditLog(rdir, {
+        hook: "before_tool_call",
+        role: sessionRole(ctx),
+        action: "BLOCK",
+        tool: toolName,
+        reason: archiveWrite.reason,
+      });
+      return { block: true, blockReason: archiveWrite.reason };
+    }
+
+    if (isArchiveTool(api, toolName, params)) return {};
+
+    const shouldBlock =
+      sessionRole(ctx) === "worker"
+        ? stageInfo.stage !== "execute" && isExploratoryTool(toolName, params)
+        : shouldBlockToolForStage(stageInfo, toolName, params);
+    if (shouldBlock) {
+      const reason = `[deep-research-guard] ${stageInfo.blockedReason}`;
+      auditLog(rdir, { hook: "before_tool_call", action: "BLOCK", tool: toolName, reason });
+      return { block: true, blockReason: reason };
+    }
+
+    auditLog(rdir, {
+      hook: "before_tool_call",
+      role: sessionRole(ctx),
+      action: "ALLOW",
+      tool: toolName,
+      stage: stageInfo.stage,
+    });
+    return {};
+  });
+
+  api.on("after_tool_call", async (event, ctx) => {
+    const signal = parseSessionSignal(event.result);
+    if (signal?.action === "clear") {
+      bindActiveResearch(ctx, null);
+    } else if (signal?.action === "start" || signal?.action === "activate") {
+      const rebound = rebindOwnedActiveSession(ctx, signal);
+      if (rebound) {
+        bindActiveResearch(ctx, rebound.researchDir, rebound.marker);
+      }
+    }
+
+    const rdir = activeResearchDir(ctx);
+    if (!rdir) return;
+    markToolActivity(ctx, event);
+    const { toolName, toolCallId, durationMs } = event;
+    auditLog(rdir, { hook: "after_tool_call", role: sessionRole(ctx), tool: toolName, toolCallId, durationMs });
+  });
+
+  api.on("before_message_write", (event, ctx) => {
+    const rdir = activeResearchDir(ctx);
+    if (!rdir) {
+      bindActiveResearch(ctx, null);
+      return {};
+    }
+    bindActiveResearch(ctx, rdir);
+
+    const meta = readMeta(rdir);
+    if (!meta) {
+      return {};
+    }
+    if (isAssistantMessage(event?.message)) {
+      clearPendingToolContinuation(ctx);
+    }
+    const stageInfo = detectArchiveStage(api, rdir, meta);
+    const interception = maybeResumeUnfinishedResearch(
+      api,
+      ctx,
+      rdir,
+      meta,
+      stageInfo,
+      event?.message,
+    );
+    if (!interception) {
+      return {};
+    }
+    return { block: true };
+  });
+
+  api.on("agent_end", async (event, ctx) => {
+    const rdir = activeResearchDir(ctx);
+    if (!rdir) return {};
+
+    const meta = readMeta(rdir);
+    const stageInfo = meta ? detectArchiveStage(api, rdir, meta) : { stage: "unknown", summary: "" };
+    maybeResumeAfterToolIdle(api, ctx, rdir, meta, stageInfo, event);
+    auditLog(rdir, {
+      hook: "agent_end",
+      role: sessionRole(ctx),
+      success: event.success,
+      stage: stageInfo.stage,
+      round: meta?.current_round,
+      status: meta?.status,
+      error: event.error,
+      durationMs: event.durationMs,
+    });
+  });
+
+  api.on("session_end", (_event, ctx) => {
+    const key = sessionCacheKey(ctx);
+    if (key) {
+      ACTIVE_SESSIONS.delete(key);
+    }
+  });
+
+  api.on("subagent_spawned", (event, ctx) => {
+    const requesterSessionKey = trimToString(ctx?.requesterSessionKey) || trimToString(event?.requesterSessionKey);
+    const childSessionKey = trimToString(ctx?.childSessionKey) || trimToString(event?.childSessionKey);
+    linkWorkerSession(requesterSessionKey, childSessionKey);
+  });
+
+  api.on("subagent_ended", (event, ctx) => {
+    const targetSessionKey = trimToString(event?.targetSessionKey) || trimToString(ctx?.childSessionKey);
+    unlinkWorkerSession(targetSessionKey);
+  });
+}
+
+module.exports = {
+  id: "deep-research-guard",
+  name: "Deep Research Guard",
+  description:
+    "Enforces deep-research archive discipline with prompt guidance, tool gating, stop interception, and audit logging.",
+  version: "1.5.0",
+  register,
+  __testing: {
+    detectArchiveStage,
+    shouldBlockToolForStage,
+    isExploratoryTool,
+    fileLooksPlaceholder,
+    buildStagePrompt,
+    buildWorkerPrompt,
+    buildContinuationEvent,
+    buildPostToolContinuationEvent,
+    hasToolCall,
+    isTerminalAssistantMessage,
+    maybeResumeAfterToolIdle,
+    maybeResumeUnfinishedResearch,
+    sessionRole,
+    extractWriteTargets,
+    validateWorkerArchiveWrite,
+    validateMetaWrite,
+    validateFinalRoundRegistryWrite,
+    validateFinalReportWrite,
+    validateArchiveWrite,
+    validateInactiveArchiveBootstrap,
+    parseArchiveTarget,
+    createDeepResearchSessionTool,
+    activeResearchDir,
+    bindActiveResearch,
+    parseSessionSignal,
+    rebindOwnedActiveSession,
+    linkWorkerSession,
+    unlinkWorkerSession,
+    markToolActivity,
+    clearPendingToolContinuation,
+    resetGuardActivation: () => ACTIVE_SESSIONS.clear(),
+    readActiveSession,
+  },
+};

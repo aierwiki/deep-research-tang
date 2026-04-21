@@ -1,0 +1,12 @@
+{
+  "round": 1,
+  "seed_clues": [
+    {
+      "clue_id": "R01-C01",
+      "source_round": 0,
+      "source_ref": "original-question",
+      "question": "这个方案怎么样？",
+      "why_it_matters": "用户想知道结果。"
+    }
+  ]
+}

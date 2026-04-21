@@ -1,0 +1,8 @@
+{
+  "topic": "api-gateway-eval",
+  "original_question": "评估某 API gateway 方案是否适合当前项目。",
+  "target_depth": 1,
+  "depth_mode": "user-specified",
+  "current_round": 1,
+  "status": "in_progress"
+}

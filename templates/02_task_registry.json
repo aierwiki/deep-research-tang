@@ -1,0 +1,22 @@
+{
+  "round": 1,
+  "tasks": [
+    {
+      "task_id": "R01-T01",
+      "title": "replace-with-task-title",
+      "task_type": "exploratory",
+      "research_dimension": "replace-with-dimension",
+      "key_question": "replace-with-key-question",
+      "planned_actions": [
+        "action-1",
+        "action-2",
+        "action-3"
+      ],
+      "expected_evidence": [
+        "evidence-1"
+      ],
+      "depends_on": [],
+      "report_path": "round_01/tasks/task_01_replace-with-slug.md"
+    }
+  ]
+}

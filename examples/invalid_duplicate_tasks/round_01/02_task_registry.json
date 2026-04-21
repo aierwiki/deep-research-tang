@@ -1,0 +1,39 @@
+{
+  "round": 1,
+  "tasks": [
+    {
+      "task_id": "R01-T01",
+      "title": "搜方案介绍",
+      "task_type": "exploratory",
+      "research_dimension": "overview",
+      "key_question": "这个方案怎么样？",
+      "planned_actions": [
+        "搜索介绍",
+        "看简介",
+        "写结论"
+      ],
+      "expected_evidence": [
+        "简介"
+      ],
+      "depends_on": [],
+      "report_path": "round_01/tasks/task_01_intro.md"
+    },
+    {
+      "task_id": "R01-T02",
+      "title": "再搜方案介绍",
+      "task_type": "exploratory",
+      "research_dimension": "overview",
+      "key_question": "这个方案怎么样？",
+      "planned_actions": [
+        "换个关键词搜索",
+        "再看简介",
+        "再写结论"
+      ],
+      "expected_evidence": [
+        "简介"
+      ],
+      "depends_on": [],
+      "report_path": "round_01/tasks/task_02_intro.md"
+    }
+  ]
+}

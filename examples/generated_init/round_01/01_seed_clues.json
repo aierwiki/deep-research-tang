@@ -1,0 +1,12 @@
+{
+  "round": 1,
+  "seed_clues": [
+    {
+      "clue_id": "R01-C01",
+      "source_round": 0,
+      "source_ref": "original-question",
+      "question": "是否应该引入统一 API gateway",
+      "why_it_matters": "这是本次深度研究的初始切入问题。"
+    }
+  ]
+}

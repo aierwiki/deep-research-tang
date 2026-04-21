@@ -1,0 +1,8 @@
+{
+  "topic": "api-gateway",
+  "original_question": "是否应该引入统一 API gateway",
+  "target_depth": 2,
+  "depth_mode": "user-specified",
+  "current_round": 0,
+  "status": "initialized"
+}
