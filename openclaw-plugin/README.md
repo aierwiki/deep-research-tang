@@ -69,6 +69,22 @@ python scripts/openclaw_deep_research_session.py start \
   --depth-mode user-specified
 ```
 
+When a round is complete, prefer one atomic lifecycle action instead of hand-editing `00_meta.json`:
+
+```bash
+python scripts/openclaw_deep_research_session.py advance-round --strict
+```
+
+This validates the current round, updates meta, and scaffolds the next round when another round is still required.
+
+When the final report is truly ready:
+
+```bash
+python scripts/openclaw_deep_research_session.py finalize --strict
+```
+
+This validates the whole archive and marks the session completed.
+
 To continue an existing archive:
 
 ```bash

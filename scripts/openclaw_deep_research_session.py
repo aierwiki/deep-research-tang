@@ -5,10 +5,12 @@ This script is designed to live alongside the installed skill bundle, but it
 also works from the repository checkout.
 
 Commands:
-  start     Create a fresh archive and bind it as the active research session
-  activate  Bind an existing research directory as the active session
-  clear     Clear the active session binding
-  status    Print the current active session binding
+  start         Create a fresh archive and bind it as the active research session
+  activate      Bind an existing research directory as the active session
+  advance-round Validate the current round, update meta, and scaffold the next round when needed
+  finalize      Validate the full archive and mark the research completed
+  clear         Clear the active session binding
+  status        Print the current active session binding
 """
 from __future__ import annotations
 
@@ -17,6 +19,19 @@ import json
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
+
+from init_deep_research_archive import (
+    initialize_archive,
+    maybe_run_initial_check,
+    resolve_templates_dir,
+    init_round_files,
+)
+from deep_research_state_machine import (
+    TransitionEvent,
+    load_meta,
+    save_meta,
+)
+from check_deep_research_archive import check_archive
 
 
 def scripts_dir() -> Path:
@@ -50,31 +65,6 @@ def emit(payload: dict) -> None:
     print(f"DEEP_RESEARCH_SESSION {json.dumps(payload, ensure_ascii=False)}")
 
 
-def parse_init_stdout(stdout: str) -> Path:
-    lines = [line.strip() for line in stdout.splitlines() if line.strip()]
-    for line in reversed(lines):
-        try:
-            payload = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        research_dir = payload.get("research_dir")
-        if not isinstance(research_dir, str) or not research_dir.strip():
-            continue
-        candidate = Path(research_dir).expanduser().resolve()
-        if (candidate / "00_meta.json").exists():
-            return candidate
-
-    for line in reversed(lines):
-        candidate = Path(line).expanduser()
-        if not candidate.is_absolute():
-            continue
-        resolved = candidate.resolve()
-        if (resolved / "00_meta.json").exists():
-            return resolved
-
-    raise SystemExit("failed to parse research_dir from init_deep_research_archive.py output")
-
-
 def write_state(workspace_dir: Path, payload: dict) -> None:
     marker = state_file(workspace_dir)
     marker.parent.mkdir(parents=True, exist_ok=True)
@@ -84,7 +74,7 @@ def write_state(workspace_dir: Path, payload: dict) -> None:
 def read_state(workspace_dir: Path) -> dict | None:
     marker = state_file(workspace_dir)
     if not marker.exists():
-      return None
+        return None
     try:
         data = json.loads(marker.read_text(encoding="utf-8"))
     except json.JSONDecodeError:
@@ -92,37 +82,67 @@ def read_state(workspace_dir: Path) -> dict | None:
     return data if isinstance(data, dict) else None
 
 
-def cmd_start(args: argparse.Namespace) -> int:
-    from init_deep_research_archive import main as _unused  # noqa: F401
-    import subprocess
+def fail(message: str) -> "NoReturn":
+    raise SystemExit(message)
 
+
+def resolve_research_dir(args: argparse.Namespace) -> tuple[Path, Path]:
+    workspace_dir = args.workspace_dir.resolve()
+    explicit = getattr(args, "research_dir", None)
+    if explicit:
+        research_dir = Path(explicit).expanduser().resolve()
+    else:
+        payload = read_state(workspace_dir)
+        research_dir_value = str(payload.get("research_dir", "")).strip() if payload else ""
+        if not research_dir_value:
+            fail("no active research session for this workspace")
+        research_dir = Path(research_dir_value).expanduser().resolve()
+    if not research_dir.is_dir():
+        fail(f"research directory not found: {research_dir}")
+    meta_path = research_dir / "00_meta.json"
+    if not meta_path.exists():
+        fail(f"00_meta.json not found under research directory: {research_dir}")
+    return workspace_dir, research_dir
+
+
+def emit_and_persist(workspace_dir: Path, payload: dict, *, persist: bool = True) -> None:
+    if persist:
+        write_state(workspace_dir, payload)
+    emit(payload)
+
+
+def round_pass_payload(action: str, workspace_dir: Path, research_dir: Path, **extra: object) -> dict:
+    payload = {
+        "version": 1,
+        "action": action,
+        "workspace_dir": str(workspace_dir),
+        "research_dir": str(research_dir),
+        "activated_at": utc_now(),
+    }
+    payload.update(extra)
+    return payload
+
+
+def cmd_start(args: argparse.Namespace) -> int:
     workspace_dir = args.workspace_dir.resolve()
     output_root = (args.output_root or workspace_dir).resolve()
-    init_script = scripts_dir() / "init_deep_research_archive.py"
-    cmd = [
-        sys.executable,
-        str(init_script),
-        "--json",
-        "--topic",
-        args.topic,
-        "--question",
-        args.question,
-        "--target-depth",
-        str(args.target_depth),
-        "--depth-mode",
-        args.depth_mode,
-        "--workspace-root",
-        str(repo_root()),
-        "--output-root",
-        str(output_root),
-    ]
-    if args.research_dir_name:
-        cmd.extend(["--research-dir-name", args.research_dir_name])
-    if args.no_check:
-        cmd.append("--no-check")
-
-    result = subprocess.run(cmd, check=True, capture_output=True, text=True)
-    research_dir = parse_init_stdout(result.stdout)
+    try:
+        research_dir = initialize_archive(
+            topic=args.topic,
+            question=args.question,
+            target_depth=args.target_depth,
+            depth_mode=args.depth_mode,
+            workspace_root=repo_root(),
+            output_root=output_root,
+            research_dir_name=args.research_dir_name,
+        )
+    except (ValueError, FileExistsError, FileNotFoundError) as exc:
+        raise SystemExit(str(exc))
+    meta = load_meta(research_dir)
+    meta.apply_event(TransitionEvent.START_ROUND, round_number=1)
+    save_meta(research_dir, meta)
+    if not args.no_check:
+        maybe_run_initial_check(research_dir)
     payload = {
         "version": 1,
         "action": "start",
@@ -130,6 +150,8 @@ def cmd_start(args: argparse.Namespace) -> int:
         "research_dir": str(research_dir),
         "topic": args.topic,
         "question": args.question,
+        "current_round": 1,
+        "status": meta.status.value,
         "activated_at": utc_now(),
     }
     write_state(workspace_dir, payload)
@@ -138,22 +160,70 @@ def cmd_start(args: argparse.Namespace) -> int:
 
 
 def cmd_activate(args: argparse.Namespace) -> int:
-    workspace_dir = args.workspace_dir.resolve()
-    research_dir = Path(args.research_dir).expanduser().resolve()
-    meta_path = research_dir / "00_meta.json"
-    if not research_dir.is_dir():
-        raise SystemExit(f"research directory not found: {research_dir}")
-    if not meta_path.exists():
-        raise SystemExit(f"00_meta.json not found under research directory: {research_dir}")
-    payload = {
-        "version": 1,
-        "action": "activate",
-        "workspace_dir": str(workspace_dir),
-        "research_dir": str(research_dir),
-        "activated_at": utc_now(),
-    }
-    write_state(workspace_dir, payload)
-    emit(payload)
+    workspace_dir, research_dir = resolve_research_dir(args)
+    payload = round_pass_payload("activate", workspace_dir, research_dir)
+    emit_and_persist(workspace_dir, payload)
+    return 0
+
+
+def run_validation_or_fail(research_dir: Path, *, strict: bool, round_num: int | None = None) -> dict:
+    report = check_archive(research_dir, strict=strict, only_round=round_num)
+    if report["result"] != "PASS":
+        raise SystemExit(json.dumps(report, ensure_ascii=False, indent=2))
+    return report
+
+
+def cmd_advance_round(args: argparse.Namespace) -> int:
+    workspace_dir, research_dir = resolve_research_dir(args)
+    meta = load_meta(research_dir)
+    if meta.current_round <= 0:
+        fail("cannot advance round: current_round must be > 0")
+
+    run_validation_or_fail(research_dir, strict=args.strict, round_num=meta.current_round)
+
+    completed_round = meta.current_round
+    meta.apply_event(TransitionEvent.ROUND_PASS, round_number=completed_round)
+
+    next_round = None
+    if meta.status.value == "ready_for_next_round":
+        next_round = completed_round + 1
+        templates_dir = resolve_templates_dir(repo_root())
+        next_round_dir = research_dir / f"round_{next_round:02d}"
+        if next_round_dir.exists():
+            fail(f"next round directory already exists: {next_round_dir}")
+        init_round_files(research_dir, templates_dir, next_round)
+        meta.apply_event(TransitionEvent.START_ROUND, round_number=next_round)
+
+    save_meta(research_dir, meta)
+    payload = round_pass_payload(
+        "advance-round",
+        workspace_dir,
+        research_dir,
+        validated_round=completed_round,
+        strict=args.strict,
+        next_round=next_round,
+        status=meta.status.value,
+        current_round=meta.current_round,
+    )
+    emit_and_persist(workspace_dir, payload)
+    return 0
+
+
+def cmd_finalize(args: argparse.Namespace) -> int:
+    workspace_dir, research_dir = resolve_research_dir(args)
+    meta = load_meta(research_dir)
+    run_validation_or_fail(research_dir, strict=args.strict, round_num=None)
+    meta.apply_event(TransitionEvent.FINALIZE)
+    save_meta(research_dir, meta)
+    payload = round_pass_payload(
+        "finalize",
+        workspace_dir,
+        research_dir,
+        strict=args.strict,
+        status=meta.status.value,
+        current_round=meta.current_round,
+    )
+    emit_and_persist(workspace_dir, payload)
     return 0
 
 
@@ -185,15 +255,23 @@ def cmd_status(args: argparse.Namespace) -> int:
             }
         )
         return 0
-    emit(
-        {
-            "version": 1,
-            "action": "status",
-            "workspace_dir": str(workspace_dir),
-            "active": True,
-            **payload,
-        }
-    )
+    research_dir_value = str(payload.get("research_dir", "")).strip()
+    enriched = {
+        "version": 1,
+        "action": "status",
+        "workspace_dir": str(workspace_dir),
+        "active": True,
+        **payload,
+    }
+    if research_dir_value:
+        try:
+            meta = load_meta(Path(research_dir_value))
+            enriched["current_round"] = meta.current_round
+            enriched["status"] = meta.status.value
+            enriched["target_depth"] = meta.target_depth
+        except Exception:
+            pass
+    emit(enriched)
     return 0
 
 
@@ -216,6 +294,24 @@ def build_parser() -> argparse.ArgumentParser:
     activate.add_argument("--research-dir", required=True)
     activate.add_argument("--workspace-dir", type=Path, default=default_workspace_dir())
     activate.set_defaults(func=cmd_activate)
+
+    advance_round = sub.add_parser(
+        "advance-round",
+        help="validate the current round, update meta, and scaffold the next round when required",
+    )
+    advance_round.add_argument("--research-dir")
+    advance_round.add_argument("--workspace-dir", type=Path, default=default_workspace_dir())
+    advance_round.add_argument("--strict", action="store_true")
+    advance_round.set_defaults(func=cmd_advance_round)
+
+    finalize = sub.add_parser(
+        "finalize",
+        help="validate the full archive and mark the research completed",
+    )
+    finalize.add_argument("--research-dir")
+    finalize.add_argument("--workspace-dir", type=Path, default=default_workspace_dir())
+    finalize.add_argument("--strict", action="store_true")
+    finalize.set_defaults(func=cmd_finalize)
 
     clear = sub.add_parser("clear", help="clear the active research archive binding")
     clear.add_argument("--workspace-dir", type=Path, default=default_workspace_dir())

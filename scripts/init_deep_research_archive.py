@@ -66,6 +66,24 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def resolve_templates_dir(workspace_root: Path | None) -> Path:
+    root = workspace_root or Path(__file__).parent.parent
+    templates_dir = root / "deep-research" / "templates"
+    if templates_dir.exists():
+        return templates_dir
+    fallback = Path(__file__).parent.parent / "templates"
+    if fallback.exists():
+        return fallback
+    raise FileNotFoundError(f"templates dir not found: {templates_dir}")
+
+
+def build_research_dir(output_root: Path, topic: str, research_dir_name: str = "") -> Path:
+    if research_dir_name:
+        return output_root / research_dir_name
+    date_tag = datetime.now().strftime("%Y%m%d")
+    return output_root / f"research_{date_tag}_{sanitize_slug(topic)}"
+
+
 def sanitize_slug(s: str) -> str:
     val = re.sub(r"[^a-zA-Z0-9\-_.]+", "-", s.strip().lower())
     val = re.sub(r"-{2,}", "-", val).strip("-")
@@ -94,17 +112,18 @@ def emit_success(args: argparse.Namespace, research_dir: Path) -> None:
     print(research_dir)
 
 
-def init_round_one(research_dir: Path, templates_dir: Path) -> None:
-    round_dir = research_dir / "round_01"
+def init_round_files(research_dir: Path, templates_dir: Path, round_number: int) -> None:
+    pad = str(round_number).zfill(2)
+    round_dir = research_dir / f"round_{pad}"
     tasks_dir = round_dir / "tasks"
     tasks_dir.mkdir(parents=True, exist_ok=True)
 
     seed = load_json_template(templates_dir / "01_seed_clues.json")
-    seed["round"] = 1
+    seed["round"] = round_number
     write_json(round_dir / "01_seed_clues.json", seed)
 
     registry = load_json_template(templates_dir / "02_task_registry.json")
-    registry["round"] = 1
+    registry["round"] = round_number
     write_json(round_dir / "02_task_registry.json", registry)
 
     summary_src = templates_dir / "03_round_summary.md"
@@ -113,7 +132,7 @@ def init_round_one(research_dir: Path, templates_dir: Path) -> None:
     )
 
     delta = load_json_template(templates_dir / "04_delta_report.json")
-    delta["round"] = 1
+    delta["round"] = round_number
     write_json(round_dir / "04_delta_report.json", delta)
 
     task_tmpl = templates_dir / "task_report.md"
@@ -122,31 +141,30 @@ def init_round_one(research_dir: Path, templates_dir: Path) -> None:
     )
 
 
-def main() -> None:
-    args = parse_args()
+def initialize_archive(
+    *,
+    topic: str,
+    question: str,
+    target_depth: int,
+    depth_mode: str = DepthMode.AUTO.value,
+    workspace_root: Path | None = None,
+    output_root: Path | None = None,
+    research_dir_name: str = "",
+    create_round_one: bool = True,
+) -> Path:
+    if target_depth <= 0:
+        raise ValueError("target_depth must be > 0")
 
-    if args.target_depth <= 0:
-        print("ERROR: --target-depth must be > 0", file=sys.stderr)
-        sys.exit(1)
-
-    workspace_root = args.workspace_root or Path(__file__).parent.parent
-    templates_dir = workspace_root / "deep-research" / "templates"
-    if not templates_dir.exists():
-        # Fallback: script lives inside deep-research/scripts/
-        templates_dir = Path(__file__).parent.parent / "templates"
-    if not templates_dir.exists():
-        print(f"ERROR: templates dir not found: {templates_dir}", file=sys.stderr)
-        sys.exit(1)
-
-    if args.research_dir_name:
-        research_dir = args.output_root / args.research_dir_name
-    else:
-        date_tag = datetime.now().strftime("%Y%m%d")
-        research_dir = args.output_root / f"research_{date_tag}_{sanitize_slug(args.topic)}"
+    resolved_output_root = (output_root or Path.cwd()).resolve()
+    templates_dir = resolve_templates_dir(workspace_root.resolve() if workspace_root else None)
+    research_dir = build_research_dir(
+        resolved_output_root,
+        topic=topic,
+        research_dir_name=research_dir_name,
+    )
 
     if research_dir.exists():
-        print(f"ERROR: directory already exists: {research_dir}", file=sys.stderr)
-        sys.exit(1)
+        raise FileExistsError(f"directory already exists: {research_dir}")
 
     research_dir.mkdir(parents=True)
 
@@ -156,12 +174,12 @@ def main() -> None:
         "",
         "## 原始问题",
         "",
-        args.question.strip(),
+        question.strip(),
         "",
         "## 研究目标",
         "",
-        f"- 主题: {args.topic.strip()}",
-        f"- 目标轮次: {args.target_depth}",
+        f"- 主题: {topic.strip()}",
+        f"- 目标轮次: {target_depth}",
         "- 按 deep-research 归档协议生成全量归档",
         "",
         "## 约束条件",
@@ -176,17 +194,17 @@ def main() -> None:
 
     # 00_meta.json
     meta = DeepResearchMeta(
-        topic=args.topic.strip(),
-        original_question=args.question.strip(),
-        target_depth=args.target_depth,
-        depth_mode=DepthMode(args.depth_mode),
+        topic=topic.strip(),
+        original_question=question.strip(),
+        target_depth=target_depth,
+        depth_mode=DepthMode(depth_mode),
         current_round=0,
         status=ResearchStatus.INITIALIZED,
     )
     save_meta(research_dir, meta)
 
-    # round_01/ skeleton
-    init_round_one(research_dir, templates_dir)
+    if create_round_one:
+        init_round_files(research_dir, templates_dir, 1)
 
     # final_report.md placeholder
     final_src = templates_dir / "final_report.md"
@@ -194,24 +212,50 @@ def main() -> None:
         final_src.read_text(encoding="utf-8"), encoding="utf-8"
     )
 
+    return research_dir
+
+
+def maybe_run_initial_check(research_dir: Path) -> None:
+    import subprocess
+
+    checker = Path(__file__).parent / "check_deep_research_archive.py"
+    if not checker.exists():
+        return
+    result = subprocess.run(
+        [sys.executable, str(checker), "--research-dir", str(research_dir)],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        print(
+            "WARN: initial check returned non-zero (templates not filled yet):",
+            file=sys.stderr,
+        )
+        if result.stdout:
+            print(result.stdout, file=sys.stderr, end="" if result.stdout.endswith("\n") else "\n")
+
+
+def main() -> None:
+    args = parse_args()
+
+    try:
+        research_dir = initialize_archive(
+            topic=args.topic,
+            question=args.question,
+            target_depth=args.target_depth,
+            depth_mode=args.depth_mode,
+            workspace_root=args.workspace_root,
+            output_root=args.output_root,
+            research_dir_name=args.research_dir_name,
+        )
+    except (ValueError, FileExistsError, FileNotFoundError) as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        sys.exit(1)
+
     emit_success(args, research_dir)
 
     if not args.no_check:
-        import subprocess
-        checker = Path(__file__).parent / "check_deep_research_archive.py"
-        if checker.exists():
-            result = subprocess.run(
-                [sys.executable, str(checker), "--research-dir", str(research_dir)],
-                capture_output=True,
-                text=True,
-            )
-            if result.returncode != 0:
-                print(
-                    "WARN: initial check returned non-zero (templates not filled yet):",
-                    file=sys.stderr,
-                )
-                if result.stdout:
-                    print(result.stdout, file=sys.stderr, end="" if result.stdout.endswith("\n") else "\n")
+        maybe_run_initial_check(research_dir)
 
 
 if __name__ == "__main__":

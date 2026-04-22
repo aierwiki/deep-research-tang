@@ -56,6 +56,30 @@ OpenClaw 中如果存在 `deep_research_session` 工具，**必须优先调用�
 }
 ```
 
+轮次推进和最终收口也优先继续走同一个工具，而不是手工改 `00_meta.json`：
+
+```json
+{
+  "action": "advance-round"
+}
+```
+
+适用时机：当前轮的 `03_round_summary.md` 和 `04_delta_report.json` 已经写完，准备进入下一轮或确认已完成全部轮次。这个动作会原子完成：
+
+- 校验当前轮
+- 更新本轮通过后的 meta 状态
+- 若还没到目标轮次，则自动起好下一轮骨架
+
+全部轮次完成且 `final_report.md` 已写成真实内容后，再调用：
+
+```json
+{
+  "action": "finalize"
+}
+```
+
+这个动作会先校验全归档，再把研究状态原子收口到 `completed`。
+
 只有在该工具不存在或不可用时，才允许退回到脚本方式：
 
 ```bash
@@ -78,6 +102,7 @@ python scripts/openclaw_deep_research_session.py activate \
 - 如果 `deep_research_session` 工具或会话脚本调用失败，**禁止**退化成手工 `mkdir research_xxx` 再继续研究
 - 正确做法是：读取错误，修复原因，重试会话启动
 - 只有会话真正启动/激活成功后，才允许写 `00_meta.json`、`round_N/*`、`final_report.md`
+- OpenClaw 中优先使用 `deep_research_session` 的 `advance-round` / `finalize` 完成生命周期跳转，不要手工编辑 `00_meta.json` 推进轮次或收尾
 
 在 OpenClaw 中，启动或激活研究会话后，**进入任何真实研究动作前必须先读取以下文件**，并以它们作为唯一权威协议：
 
@@ -167,6 +192,14 @@ python scripts/openclaw_deep_research_session.py activate \
 
 这里的“执行探索”不是机械地对每个任务发一个搜索请求就算完成。一个探索任务本身可能就是复杂执行单元：需要多次搜索、读取资料、编写并运行代码、抓取网页、调用外部工具、做交叉验证，甚至中途根据发现调整该子任务内部的执行路径。评价标准是这个任务有没有把该方向真正探明，而不是有没有发出过一个 query。
 
+如果任务涉及新闻、价格、市场走势、政策变化、宏观数据、公司动态等**强时效性信息**，执行纪律要再提高一档：
+
+- 优先获取更近的信息，不能拿明显过时的材料直接下结论
+- 必须显式记录**绝对日期**，不要只写“今天/昨天/最近”
+- 必须区分“事件发生日期”“信息发布日期”“数据统计日期”，避免把时间混为一谈
+- 关键事实尽量做交叉验证；重要结论不要只压在单一来源上
+- 如果不同来源时间冲突或口径冲突，要在任务报告里显式写出，而不是静默忽略
+
 每个任务的执行结果必须单独保存到 `round_N/tasks/` 目录，不允许把多个任务混写在同一个文件中。每个任务结果文件都应明确记录：
 
 - 任务目标和对应的 `task_id`
@@ -175,6 +208,16 @@ python scripts/openclaw_deep_research_session.py activate \
 - 初步判断或观点
 - 不确定项、反例、未解问题
 - 下一轮可能值得追踪的线索
+
+如果仓库中存在 `round_N/tasks/task_report.template.md`，应优先按这个模板写任务报告。至少要保留这些 section：
+
+- `Task ID`
+- `Goal`
+- `Executed Actions`
+- `Key Evidence`
+- `Findings`
+- `Open Questions`
+- `Next Leads`
 
 一个合格的单任务研究至少满足以下标准：
 
@@ -215,6 +258,7 @@ python scripts/openclaw_deep_research_session.py activate \
 
 - 检查结果为 `PASS`：才允许更新 `00_meta.json` 中的轮次状态，并进入下一轮，或在所有轮次都完成后进入独立的最终综合阶段
 - 检查结果为 `FAIL`：必须先修复失败项，再重新运行检查器；禁止跳过失败项继续研究
+- 在 OpenClaw 中，优先调用 `deep_research_session` 的 `advance-round`，因为它会把“校验当前轮 + 更新 meta + 必要时起下一轮”作为一个原子动作完成；如果任务报告只是空壳，`advance-round` 会直接拒绝通过
 
 ### 5. 迭代决策
 
@@ -269,7 +313,9 @@ python scripts/openclaw_deep_research_session.py activate \
 
 报告要回答用户的原始问题，给出明确的结论和建议。包含：
 - 核心结论
+- 跨轮综合与证据权重
 - 关键发现及其证据来源（哪一轮、哪个任务发现的）
+- 时效性与交叉验证说明
 - 具体建议
 - 局限性和不确定性说明
 
@@ -281,6 +327,8 @@ python scripts/openclaw_deep_research_session.py activate \
 - 每一轮都存在完整归档文件，并通过检查
 - `00_meta.json` 必须先进入“已完成所有轮次、等待最终综合”的状态，再开始撰写真实的 `final_report.md`
 - `final_report.md` 必须引用轮次和任务来源，不能只给出无来源结论
+- `final_report.md` 必须回看并综合**全部轮次**的任务报告、轮次总结和 delta 信息，禁止只根据最后一轮或少数几个任务草率收尾
+- 若问题含有时效性，最终报告必须显式交代关键日期、数据日期与交叉验证动作
 
 如果严格检查模式失败，Agent 必须回到缺失轮次或缺失文件处补齐；不能直接输出“阶段性结论”替代最终报告。
 

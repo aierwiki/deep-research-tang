@@ -96,10 +96,23 @@ const FINAL_REPORT_TEMPLATE = `# 最终研究报告
 
 - 
 
+## 跨轮综合与证据权重
+
+- 结论：
+  综合依据：
+  证据权重说明：
+
 ## 关键发现与证据来源
 
 - 发现：
-  来源：
+  来源：R01-T01, R02-T03
+
+## 时效性与交叉验证
+
+- 关键时间点：
+  信息日期/数据日期：
+  验证动作：
+  交叉来源：
 
 ## 具体建议
 
@@ -108,6 +121,34 @@ const FINAL_REPORT_TEMPLATE = `# 最终研究报告
 ## 局限性与不确定性
 
 -`;
+const REQUIRED_FINAL_REPORT_SECTIONS = [
+  "核心结论",
+  "跨轮综合与证据权重",
+  "关键发现与证据来源",
+  "时效性与交叉验证",
+  "具体建议",
+  "局限性与不确定性",
+];
+const REQUIRED_TASK_REGISTRY_FIELDS = [
+  "task_id",
+  "title",
+  "task_type",
+  "research_dimension",
+  "key_question",
+  "planned_actions",
+  "expected_evidence",
+  "depends_on",
+  "report_path",
+];
+const REQUIRED_TASK_REPORT_SECTIONS = [
+  "Task ID",
+  "Goal",
+  "Executed Actions",
+  "Key Evidence",
+  "Findings",
+  "Open Questions",
+  "Next Leads",
+];
 
 function trimToString(value) {
   return typeof value === "string" ? value.trim() : "";
@@ -249,12 +290,202 @@ function listTaskReportPaths(rdir, registryPath) {
   const registry = safeReadJson(registryPath);
   const tasks = Array.isArray(registry?.tasks) ? registry.tasks : [];
   return tasks
-    .map((task) => trimToString(task?.report_path))
-    .filter(Boolean)
-    .map((relPath) => ({
-      relPath,
-      absPath: path.join(rdir, relPath),
+    .map((task) => ({
+      taskId: trimToString(task?.task_id) || "?",
+      relPath: trimToString(task?.report_path),
+    }))
+    .filter((entry) => entry.relPath)
+    .map((entry) => ({
+      taskId: entry.taskId,
+      relPath: entry.relPath,
+      absPath: path.join(rdir, entry.relPath),
     }));
+}
+
+function parseMarkdownSections(text) {
+  const sections = new Map();
+  let current = null;
+  for (const line of String(text || "").split("\n")) {
+    const match = line.trim().match(/^##\s+(.+?)\s*$/);
+    if (match) {
+      current = match[1].trim();
+      if (!sections.has(current)) {
+        sections.set(current, []);
+      }
+      continue;
+    }
+    if (current) {
+      sections.get(current).push(line);
+    }
+  }
+  return sections;
+}
+
+function meaningfulSectionLines(text) {
+  return String(text || "")
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .map((line) => line.replace(/^[-*]\s+/, "").replace(/^\d+\.\s+/, "").trim())
+    .filter((line) => line && line !== "-" && line !== "*" && !line.toLowerCase().includes("replace-with"));
+}
+
+function validateTaskReportContent(filePath, taskId) {
+  if (!fs.existsSync(filePath)) {
+    return { ok: false, reason: `task ${taskId} report file is missing` };
+  }
+  let text = "";
+  try {
+    text = fs.readFileSync(filePath, "utf-8");
+  } catch (err) {
+    return { ok: false, reason: `task ${taskId} report unreadable: ${trimToString(err?.message) || "unknown error"}` };
+  }
+
+  const sections = parseMarkdownSections(text);
+  for (const section of REQUIRED_TASK_REPORT_SECTIONS) {
+    if (!sections.has(section)) {
+      return { ok: false, reason: `task ${taskId} report missing section: ${section}` };
+    }
+  }
+
+  const taskIdLines = meaningfulSectionLines(sections.get("Task ID").join("\n"));
+  if (taskIdLines.length === 0 || taskIdLines[0] !== taskId) {
+    return { ok: false, reason: `task ${taskId} report Task ID section does not match registry task_id` };
+  }
+
+  for (const section of ["Goal", "Key Evidence", "Findings", "Open Questions", "Next Leads"]) {
+    if (meaningfulSectionLines(sections.get(section).join("\n")).length === 0) {
+      return { ok: false, reason: `task ${taskId} report section is empty or placeholder-only: ${section}` };
+    }
+  }
+
+  const executedActions = meaningfulSectionLines(sections.get("Executed Actions").join("\n"));
+  if (executedActions.length < 2) {
+    return { ok: false, reason: `task ${taskId} report Executed Actions must contain at least 2 real actions` };
+  }
+
+  return { ok: true };
+}
+
+function collectAllTaskIds(rdir) {
+  const taskIds = [];
+  for (const entry of fs.readdirSync(rdir, { withFileTypes: true })) {
+    if (!entry.isDirectory() || !/^round_\d+$/.test(entry.name)) {
+      continue;
+    }
+    const registry = safeReadJson(path.join(rdir, entry.name, "02_task_registry.json"));
+    const tasks = Array.isArray(registry?.tasks) ? registry.tasks : [];
+    for (const task of tasks) {
+      const taskId = trimToString(task?.task_id);
+      if (taskId) {
+        taskIds.push(taskId);
+      }
+    }
+  }
+  return taskIds;
+}
+
+function validateFinalReportContent(filePath, rdir, meta) {
+  if (!fs.existsSync(filePath)) {
+    return { ok: false, reason: "final_report.md is missing" };
+  }
+  let text = "";
+  try {
+    text = fs.readFileSync(filePath, "utf-8");
+  } catch (err) {
+    return { ok: false, reason: `final_report.md unreadable: ${trimToString(err?.message) || "unknown error"}` };
+  }
+  if (isPlaceholderFinalReport(filePath)) {
+    return { ok: false, reason: "final_report.md is still placeholder-filled" };
+  }
+
+  const sections = parseMarkdownSections(text);
+  for (const section of REQUIRED_FINAL_REPORT_SECTIONS) {
+    if (!sections.has(section)) {
+      return { ok: false, reason: `final_report.md missing section: ${section}` };
+    }
+  }
+
+  for (const section of REQUIRED_FINAL_REPORT_SECTIONS) {
+    if (meaningfulSectionLines(sections.get(section).join("\n")).length === 0) {
+      return { ok: false, reason: `final_report.md section is empty or placeholder-only: ${section}` };
+    }
+  }
+
+  const sourceRefs = new Set(
+    (sections.get("关键发现与证据来源").join("\n").match(/R\d{2}-T\d{2}/g) || []).map((ref) => ref.trim()),
+  );
+  const allTaskIds = collectAllTaskIds(rdir);
+  const minRequired = allTaskIds.length === 0
+    ? 1
+    : allTaskIds.length === 1
+      ? 1
+      : Math.min(allTaskIds.length, (Number(meta?.current_round) || 0) + 1);
+  if (sourceRefs.size < minRequired) {
+    return {
+      ok: false,
+      reason: `final_report.md cites only ${sourceRefs.size} task sources, need >= ${minRequired} across the completed research`,
+    };
+  }
+
+  const timelinessLines = meaningfulSectionLines(sections.get("时效性与交叉验证").join("\n"));
+  if (timelinessLines.length < 3) {
+    return {
+      ok: false,
+      reason: "final_report.md 时效性与交叉验证 section must include concrete dates and validation notes",
+    };
+  }
+  if (!/\b20\d{2}-\d{2}-\d{2}\b/.test(sections.get("时效性与交叉验证").join("\n"))) {
+    return {
+      ok: false,
+      reason: "final_report.md 时效性与交叉验证 section must include at least one absolute date like YYYY-MM-DD",
+    };
+  }
+
+  return { ok: true };
+}
+
+function validateRegistrySchema(registry) {
+  const tasks = Array.isArray(registry?.tasks) ? registry.tasks : [];
+  if (tasks.length === 0) {
+    return { ok: true };
+  }
+  for (const task of tasks) {
+    const taskId = trimToString(task?.task_id) || "?";
+    for (const field of REQUIRED_TASK_REGISTRY_FIELDS) {
+      if (!(field in task)) {
+        return {
+          ok: false,
+          reason: `task ${taskId} missing required field: ${field}`,
+        };
+      }
+    }
+    if (!trimToString(task?.title)) {
+      return { ok: false, reason: `task ${taskId} missing required field: title` };
+    }
+    if (!trimToString(task?.task_type)) {
+      return { ok: false, reason: `task ${taskId} missing required field: task_type` };
+    }
+    if (!trimToString(task?.research_dimension)) {
+      return { ok: false, reason: `task ${taskId} missing required field: research_dimension` };
+    }
+    if (!trimToString(task?.key_question)) {
+      return { ok: false, reason: `task ${taskId} missing required field: key_question` };
+    }
+    if (!trimToString(task?.report_path)) {
+      return { ok: false, reason: `task ${taskId} missing required field: report_path` };
+    }
+    if (!Array.isArray(task?.planned_actions) || task.planned_actions.length < 3) {
+      return { ok: false, reason: `task ${taskId} planned_actions must contain at least 3 actions` };
+    }
+    if (!Array.isArray(task?.expected_evidence) || task.expected_evidence.length === 0) {
+      return { ok: false, reason: `task ${taskId} expected_evidence must be a non-empty list` };
+    }
+    if (!Array.isArray(task?.depends_on)) {
+      return { ok: false, reason: `task ${taskId} depends_on must be a list` };
+    }
+  }
+  return { ok: true };
 }
 
 function resolveRoundPaths(rdir, roundNumber) {
@@ -313,6 +544,20 @@ function detectArchiveStage(api, rdir, meta) {
     );
   }
 
+  const registrySchema = validateRegistrySchema(safeReadJson(paths.registryPath));
+  if (!registrySchema.ok) {
+    return makeStage(
+      "plan",
+      `Round ${currentRound} task registry schema is invalid.`,
+      `Round ${currentRound} task registry schema invalid: ${registrySchema.reason}`,
+      [
+        "rewrite 02_task_registry.json using the current template schema",
+        "ensure every task has key_question, report_path, and planned_actions",
+      ],
+      { round: currentRound },
+    );
+  }
+
   const taskReports = listTaskReportPaths(rdir, paths.registryPath);
   const missingReports = taskReports
     .filter((entry) => !fs.existsSync(entry.absPath))
@@ -320,13 +565,30 @@ function detectArchiveStage(api, rdir, meta) {
   const placeholderReports = taskReports
     .filter((entry) => fileLooksPlaceholder(entry.absPath))
     .map((entry) => entry.relPath);
+  const invalidReports = taskReports
+    .map((entry) => ({
+      ...entry,
+      validation: validateTaskReportContent(entry.absPath, entry.taskId),
+    }))
+    .filter((entry) => !entry.validation.ok)
+    .map((entry) => ({
+      relPath: entry.relPath,
+      reason: entry.validation.reason,
+    }));
 
-  if (taskReports.length === 0 || missingReports.length > 0 || placeholderReports.length > 0) {
+  if (
+    taskReports.length === 0 ||
+    missingReports.length > 0 ||
+    placeholderReports.length > 0 ||
+    invalidReports.length > 0
+  ) {
     const blockedReason =
       missingReports.length > 0
         ? `Round ${currentRound} still has missing task reports: ${missingReports.join(", ")}`
         : placeholderReports.length > 0
           ? `Round ${currentRound} still has placeholder task reports: ${placeholderReports.join(", ")}`
+          : invalidReports.length > 0
+            ? `Round ${currentRound} still has invalid task reports: ${invalidReports.map((entry) => `${entry.relPath} (${entry.reason})`).join(", ")}`
           : `Round ${currentRound} has no registered task reports yet.`;
     return makeStage(
       "execute",
@@ -335,9 +597,10 @@ function detectArchiveStage(api, rdir, meta) {
       [
         "write missing task reports",
         "replace placeholder task reports with real evidence",
+        "rewrite invalid task reports to match the task report template",
         "continue exploration tied to registered tasks only",
       ],
-      { round: currentRound, missingReports, placeholderReports },
+      { round: currentRound, missingReports, placeholderReports, invalidReports },
     );
   }
 
@@ -403,15 +666,23 @@ function detectArchiveStage(api, rdir, meta) {
 
   const finalReportPath = path.join(rdir, "final_report.md");
   const finalReportReady = fs.existsSync(finalReportPath) && !isPlaceholderFinalReport(finalReportPath);
+  const finalReportValidation = finalReportReady
+    ? validateFinalReportContent(finalReportPath, rdir, meta)
+    : { ok: false, reason: "final_report.md is still missing or placeholder-filled" };
   const metaStatus = trimToString(meta?.status);
-  if (!finalReportReady || metaStatus !== "completed") {
+  if (!finalReportReady || !finalReportValidation.ok || metaStatus !== "completed") {
+    const blockedReason = !finalReportReady
+      ? "All rounds are complete, but final_report.md is still missing or placeholder-filled."
+      : !finalReportValidation.ok
+        ? `final_report.md is not yet sufficient: ${finalReportValidation.reason}`
+        : "final_report.md exists, but 00_meta.json is not yet marked completed.";
     return makeStage(
       "synthesize",
       "All research rounds are complete. Produce the final synthesis only now.",
-      finalReportReady
-        ? "final_report.md exists, but 00_meta.json is not yet marked completed."
-        : "All rounds are complete, but final_report.md is still missing or placeholder-filled.",
+      blockedReason,
       [
+        "read all round summaries, delta reports, and task reports before synthesizing",
+        "verify dates explicitly and cross-check time-sensitive claims with multiple sources",
         "synthesize findings across all rounds and tasks",
         "write or refine final_report.md using only completed research evidence",
         "mark 00_meta.json as completed only after the final report is real",
@@ -505,7 +776,7 @@ function sessionToolParametersSchema() {
     properties: {
       action: {
         type: "string",
-        enum: ["start", "activate", "status", "clear"],
+        enum: ["start", "activate", "advance-round", "finalize", "status", "clear"],
         description: "Session action to perform.",
       },
       topic: {
@@ -532,11 +803,15 @@ function sessionToolParametersSchema() {
       },
       research_dir: {
         type: "string",
-        description: "Absolute research directory path. Required for action=activate.",
+        description: "Absolute research directory path. Required for action=activate. Optional for action=advance-round/finalize when an active session already exists.",
       },
       no_check: {
         type: "boolean",
         description: "Skip validator after init for action=start.",
+      },
+      strict: {
+        type: "boolean",
+        description: "Run the validator in strict mode for action=advance-round or action=finalize.",
       },
     },
     required: ["action"],
@@ -596,6 +871,18 @@ function sessionToolArgs(rawParams, api) {
     return args;
   }
 
+  if (action === "advance-round" || action === "finalize") {
+    const researchDir = trimToString(rawParams?.research_dir);
+    if (researchDir) {
+      args.push("--research-dir", researchDir);
+    }
+    const strict = typeof rawParams?.strict === "boolean" ? rawParams.strict : isStrictMode(api);
+    if (strict) {
+      args.push("--strict");
+    }
+    return args;
+  }
+
   if (action === "status" || action === "clear") {
     return args;
   }
@@ -631,10 +918,29 @@ function runDeepResearchSession(api, rawParams) {
   if (!payload) {
     throw new Error("session script did not emit DEEP_RESEARCH_SESSION payload");
   }
+  const researchDir = trimToString(payload.research_dir);
+  let archive = null;
+  if (researchDir) {
+    const meta = readMeta(researchDir);
+    if (meta) {
+      const stageInfo = detectArchiveStage(api, researchDir, meta);
+      archive = {
+        research_dir: researchDir,
+        current_round: meta.current_round,
+        target_depth: meta.target_depth,
+        status: meta.status,
+        stage: stageInfo.stage,
+        summary: stageInfo.summary,
+        blocked_reason: stageInfo.blockedReason,
+        next_actions: stageInfo.nextActions,
+      };
+    }
+  }
   return {
     ok: true,
     action: payload.action,
     session: payload,
+    archive,
     signal: sessionSignalLine(payload),
   };
 }
@@ -644,7 +950,7 @@ function createDeepResearchSessionTool(api) {
     name: DEEP_RESEARCH_SESSION_TOOL,
     label: "Deep Research Session",
     description:
-      "Start, activate, inspect, or clear the active OpenClaw deep-research session. Use this before writing any research_* archive files.",
+      "Start, activate, advance, finalize, inspect, or clear the active OpenClaw deep-research session. Use this instead of manually editing 00_meta.json or stitching together round transitions.",
     parameters: sessionToolParametersSchema(),
     execute: async (_toolCallId, rawParams) => runDeepResearchSession(api, rawParams),
   };
@@ -1027,6 +1333,7 @@ function buildStagePrompt(stageInfo, meta) {
   const lines = [
     "Deep-research guard is active.",
     "Schema authority lives in templates/ and scripts/, not memory or prior runs.",
+    `Use ${DEEP_RESEARCH_SESSION_TOOL} for lifecycle transitions instead of manually editing 00_meta.json.`,
     `Current stage: ${stageInfo.stage}.`,
     stageInfo.summary,
   ];
@@ -1046,6 +1353,25 @@ function buildStagePrompt(stageInfo, meta) {
       "Do not declare the research complete unless the archive state reaches finalize.",
     );
   }
+  if (stageInfo.stage === "execute") {
+    lines.push(
+      "For time-sensitive facts, prefer fresher evidence, record absolute dates, and distinguish event dates from publish dates.",
+    );
+    lines.push(
+      "Cross-check important claims with multiple sources before treating them as settled evidence.",
+    );
+  }
+  if (stageInfo.stage === "synthesize") {
+    lines.push(
+      "Final synthesis must integrate evidence across all completed rounds, not just the latest round.",
+    );
+    lines.push(
+      "For time-sensitive claims, verify dates explicitly, prefer newer evidence, and cross-check key facts with multiple sources before writing final_report.md.",
+    );
+    lines.push(
+      "The final report must cite round/task sources broadly enough to reflect the full deep-research archive.",
+    );
+  }
   return lines.join("\n");
 }
 
@@ -1060,10 +1386,16 @@ function buildWorkerPrompt(stageInfo, meta) {
     "Allowed archive writes: only registered round task reports under round_N/tasks/.",
     "Forbidden archive writes: 00_meta.json, seed clues, task registry, round summary, delta report, final_report.md.",
     "Do not advance rounds, rewrite the task registry, or declare the full research complete.",
+    `Lifecycle transitions belong to the requester via ${DEEP_RESEARCH_SESSION_TOOL}.`,
   ];
   if (meta && Number.isInteger(meta.current_round)) {
     lines.push(
       `Coordinator status: current_round=${meta.current_round}, target_depth=${meta.target_depth}, status=${meta.status}.`,
+    );
+  }
+  if (stageInfo.stage === "execute") {
+    lines.push(
+      "If the task is time-sensitive, record exact dates and cross-check key facts instead of trusting the first source.",
     );
   }
   return lines.join("\n");
@@ -1789,6 +2121,8 @@ module.exports = {
     activeResearchDir,
     bindActiveResearch,
     parseSessionSignal,
+    validateRegistrySchema,
+    validateFinalReportContent,
     rebindOwnedActiveSession,
     linkWorkerSession,
     unlinkWorkerSession,

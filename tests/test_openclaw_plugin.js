@@ -20,6 +20,84 @@ function writeText(filePath, text) {
   fs.writeFileSync(filePath, text, "utf8");
 }
 
+function writeTaskReport(filePath, taskId) {
+  writeText(
+    filePath,
+    [
+      "# 任务报告",
+      "",
+      "## Task ID",
+      "",
+      taskId,
+      "",
+      "## Goal",
+      "",
+      "- Answer the task question.",
+      "",
+      "## Executed Actions",
+      "",
+      "1. Read docs.",
+      "2. Cross-check code.",
+      "",
+      "## Key Evidence",
+      "",
+      "- Evidence line.",
+      "",
+      "## Findings",
+      "",
+      "- Finding line.",
+      "",
+      "## Open Questions",
+      "",
+      "- Open question line.",
+      "",
+      "## Next Leads",
+      "",
+      "- Next lead line.",
+      "",
+    ].join("\n"),
+  );
+}
+
+function writeFinalReport(filePath, sourceRefs = ["R01-T01", "R01-T02"]) {
+  writeText(
+    filePath,
+    [
+      "# 最终研究报告",
+      "",
+      "## 核心结论",
+      "",
+      "- 综合结论成立。",
+      "",
+      "## 跨轮综合与证据权重",
+      "",
+      "- 结论：综合全部轮次后判断成立。",
+      `  综合依据：${sourceRefs.join(", ")}`,
+      "  证据权重说明：多轮证据一致，反例已纳入评估。",
+      "",
+      "## 关键发现与证据来源",
+      "",
+      `- 发现：关键发现一。来源：${sourceRefs.join(", ")}`,
+      "",
+      "## 时效性与交叉验证",
+      "",
+      "- 关键时间点：2026-04-21。",
+      "  信息日期/数据日期：2026-04-20 / 2026-04-21。",
+      "  验证动作：对比多个来源并区分事件发生日与发布日期。",
+      "  交叉来源：来源 A，来源 B。",
+      "",
+      "## 具体建议",
+      "",
+      "- 采取审慎建议。",
+      "",
+      "## 局限性与不确定性",
+      "",
+      "- 仍存在不确定性。",
+      "",
+    ].join("\n"),
+  );
+}
+
 test("detectArchiveStage keeps placeholder planning files in planning_placeholders", () => {
   const rdir = makeTempResearchDir();
   writeJson(path.join(rdir, "00_meta.json"), {
@@ -109,6 +187,97 @@ test("detectArchiveStage reports execution when task reports are missing", () =>
   assert.match(stage.blockedReason, /missing task reports/);
 });
 
+test("detectArchiveStage reports execution when task reports are structurally invalid", () => {
+  const rdir = makeTempResearchDir();
+  writeJson(path.join(rdir, "00_meta.json"), {
+    topic: "demo",
+    original_question: "q?",
+    target_depth: 2,
+    depth_mode: "user-specified",
+    current_round: 1,
+    status: "in_progress",
+  });
+  writeJson(path.join(rdir, "round_01", "01_seed_clues.json"), {
+    round: 1,
+    seed_clues: [
+      {
+        clue_id: "R01-C01",
+        source_round: 0,
+        source_ref: "original-question",
+        question: "What matters?",
+        why_it_matters: "Important",
+      },
+    ],
+  });
+  writeJson(path.join(rdir, "round_01", "02_task_registry.json"), {
+    round: 1,
+    tasks: [
+      {
+        task_id: "R01-T01",
+        title: "Architecture",
+        task_type: "exploratory",
+        research_dimension: "architecture",
+        key_question: "What is the current architecture?",
+        planned_actions: ["read docs", "read code", "compare"],
+        expected_evidence: ["docs", "code"],
+        depends_on: [],
+        report_path: "round_01/tasks/task_01_architecture.md",
+      },
+    ],
+  });
+  writeText(
+    path.join(rdir, "round_01", "tasks", "task_01_architecture.md"),
+    "# 任务报告\n\n## Task ID\n\nR01-T01\n",
+  );
+
+  const meta = JSON.parse(fs.readFileSync(path.join(rdir, "00_meta.json"), "utf8"));
+  const stage = plugin.__testing.detectArchiveStage(null, rdir, meta);
+  assert.equal(stage.stage, "execute");
+  assert.match(stage.blockedReason, /invalid task reports/i);
+  assert.match(stage.blockedReason, /missing section/i);
+});
+
+test("detectArchiveStage reports planning when task registry schema is invalid", () => {
+  const rdir = makeTempResearchDir();
+  writeJson(path.join(rdir, "00_meta.json"), {
+    topic: "demo",
+    original_question: "q?",
+    target_depth: 2,
+    depth_mode: "user-specified",
+    current_round: 1,
+    status: "in_progress",
+  });
+  writeJson(path.join(rdir, "round_01", "01_seed_clues.json"), {
+    round: 1,
+    seed_clues: [
+      {
+        clue_id: "R01-C01",
+        source_round: 0,
+        source_ref: "original-question",
+        question: "What matters?",
+        why_it_matters: "Important",
+      },
+    ],
+  });
+  writeJson(path.join(rdir, "round_01", "02_task_registry.json"), {
+    round: 1,
+    tasks: [
+      {
+        task_id: "R01-T01",
+        theme: "Legacy task",
+        query: "legacy query",
+        key_questions: ["What is the current architecture?"],
+      },
+    ],
+  });
+
+  const meta = JSON.parse(fs.readFileSync(path.join(rdir, "00_meta.json"), "utf8"));
+  const stage = plugin.__testing.detectArchiveStage(null, rdir, meta);
+  assert.equal(stage.stage, "plan");
+  assert.match(stage.blockedReason, /task registry schema invalid/i);
+  assert.match(stage.blockedReason, /missing required field/i);
+});
+
 test("detectArchiveStage enters synthesize after the final round passes", () => {
   const rdir = makeTempResearchDir();
   writeText(path.join(rdir, "00_research_brief.md"), "# Brief\n");
@@ -163,7 +332,7 @@ test("detectArchiveStage enters synthesize after the final round passes", () => 
       carry_forward_clues: [{ clue_id: `R${pad}-CF01`, question: "Next q" }],
       coverage_assessment: "partial",
     });
-    writeText(path.join(rdir, `round_${pad}`, "tasks", "task_01_architecture.md"), "# Task\n");
+    writeTaskReport(path.join(rdir, `round_${pad}`, "tasks", "task_01_architecture.md"), `R${pad}-T01`);
   }
 
   writeText(path.join(rdir, "final_report.md"), fs.readFileSync(path.join(process.cwd(), "templates", "final_report.md"), "utf8"));
@@ -217,12 +386,77 @@ test("detectArchiveStage reaches finalize only after final report and completed 
     carry_forward_clues: [{ clue_id: "R01-CF01", question: "Next q" }],
     coverage_assessment: "full",
   });
-  writeText(path.join(rdir, "round_01", "tasks", "task_01_architecture.md"), "# Task\n");
-  writeText(path.join(rdir, "final_report.md"), "# 最终研究报告\n\n## 核心结论\n\n- Real conclusion\n");
+  writeTaskReport(path.join(rdir, "round_01", "tasks", "task_01_architecture.md"), "R01-T01");
+  writeFinalReport(path.join(rdir, "final_report.md"));
 
   const meta = JSON.parse(fs.readFileSync(path.join(rdir, "00_meta.json"), "utf8"));
   const stage = plugin.__testing.detectArchiveStage(null, rdir, meta);
   assert.equal(stage.stage, "finalize");
+});
+
+test("detectArchiveStage keeps synthesize stage when final report is too thin", () => {
+  const rdir = makeTempResearchDir();
+  writeText(path.join(rdir, "00_research_brief.md"), "# Brief\n");
+  writeJson(path.join(rdir, "00_meta.json"), {
+    topic: "demo",
+    original_question: "q?",
+    target_depth: 2,
+    depth_mode: "user-specified",
+    current_round: 2,
+    status: "completed",
+  });
+
+  for (const round of [1, 2]) {
+    const pad = String(round).padStart(2, "0");
+    writeJson(path.join(rdir, `round_${pad}`, "01_seed_clues.json"), {
+      round,
+      seed_clues: [
+        {
+          clue_id: `R${pad}-C01`,
+          source_round: round - 1,
+          source_ref: round === 1 ? "original-question" : `R0${round - 1}-CF01`,
+          question: "What matters?",
+          why_it_matters: "Important",
+        },
+      ],
+    });
+    writeJson(path.join(rdir, `round_${pad}`, "02_task_registry.json"), {
+      round,
+      tasks: [
+        {
+          task_id: `R${pad}-T01`,
+          title: "Architecture",
+          task_type: "exploratory",
+          research_dimension: "architecture",
+          key_question: `What is round ${round}?`,
+          planned_actions: ["read docs", "read code", "compare"],
+          expected_evidence: ["docs", "code"],
+          depends_on: [],
+          report_path: `round_${pad}/tasks/task_01_architecture.md`,
+        },
+      ],
+    });
+    writeText(path.join(rdir, `round_${pad}`, "03_round_summary.md"), "# Summary\n");
+    writeJson(path.join(rdir, `round_${pad}`, "04_delta_report.json"), {
+      round,
+      new_findings: [
+        { finding_id: `R${pad}-F01`, summary: "Finding one" },
+        { finding_id: `R${pad}-F02`, summary: "Finding two" },
+        { finding_id: `R${pad}-F03`, summary: "Finding three" },
+      ],
+      contradictions: [],
+      carry_forward_clues: [{ clue_id: `R${pad}-CF01`, question: "Next q" }],
+      coverage_assessment: "partial",
+    });
+    writeTaskReport(path.join(rdir, `round_${pad}`, "tasks", "task_01_architecture.md"), `R${pad}-T01`);
+  }
+
+  writeFinalReport(path.join(rdir, "final_report.md"), ["R01-T01"]);
+  const meta = JSON.parse(fs.readFileSync(path.join(rdir, "00_meta.json"), "utf8"));
+  const stage = plugin.__testing.detectArchiveStage(null, rdir, meta);
+  assert.equal(stage.stage, "synthesize");
+  assert.match(stage.blockedReason, /not yet sufficient/i);
+  assert.match(stage.blockedReason, /task sources/i);
 });
 
 test("shouldBlockToolForStage blocks exploratory tools before summary is complete", () => {
@@ -250,18 +484,19 @@ test("shouldBlockToolForStage blocks exploratory tools before summary is complet
 test("buildStagePrompt includes stage and explicit non-completion warning", () => {
   const prompt = plugin.__testing.buildStagePrompt(
     {
-      stage: "advance",
-      summary: "Round 1 is valid but more depth is required.",
-      nextActions: ["start round_02"],
+      stage: "execute",
+      summary: "Round 1 execution is still in progress.",
+      nextActions: ["finish task report"],
     },
     {
       current_round: 1,
       target_depth: 3,
-      status: "ready_for_next_round",
+      status: "in_progress",
     },
   );
-  assert.match(prompt, /Current stage: advance/);
+  assert.match(prompt, /Current stage: execute/);
   assert.match(prompt, /Do not declare the research complete/);
+  assert.match(prompt, /absolute dates/i);
 });
 
 test("maintenance commands are not treated as exploratory tools", () => {
@@ -579,6 +814,18 @@ test("parseSessionSignal extracts activation payload from session tool result ob
   assert.equal(parsed?.research_dir, "/tmp/research_2");
 });
 
+test("deep research session tool exposes lifecycle actions", () => {
+  const tool = plugin.__testing.createDeepResearchSessionTool({});
+  assert.deepEqual(tool.parameters.properties.action.enum, [
+    "start",
+    "activate",
+    "advance-round",
+    "finalize",
+    "status",
+    "clear",
+  ]);
+});
+
 test("parseArchiveTarget recognizes deep-research archive files", () => {
   const parsed = plugin.__testing.parseArchiveTarget(
     "/Users/tangyubin/.openclaw/workspace/research_20260420_demo/round_01/02_task_registry.json",
@@ -832,6 +1079,23 @@ test("worker prompt tells subagents to finish only their assigned task", () => {
   assert.match(prompt, /task-worker guard/i);
   assert.match(prompt, /only the assigned task/i);
   assert.match(prompt, /Forbidden archive writes/i);
+});
+
+test("stage prompt prefers lifecycle tool over manual meta edits", () => {
+  const prompt = plugin.__testing.buildStagePrompt(
+    {
+      stage: "advance",
+      summary: "Round 1 is valid. Another round is still required.",
+      nextActions: ["start round_02"],
+    },
+    {
+      current_round: 1,
+      target_depth: 2,
+      status: "ready_for_next_round",
+    },
+  );
+  assert.match(prompt, /deep_research_session/i);
+  assert.match(prompt, /00_meta\.json/i);
 });
 
 test("maybeResumeUnfinishedResearch does not intercept worker stop messages", () => {

@@ -180,6 +180,14 @@ def repair_delta_no_findings(research_dir: Path, error: dict) -> bool:
     return False
 
 
+def repair_task_report_issue(research_dir: Path, error: dict) -> bool:
+    print(
+        f"  [repair] WARN: task report structure/content issue — rewrite the report from task_report.template.md: {error.get('detail')}",
+        file=sys.stderr,
+    )
+    return False
+
+
 def repair_clue_chain_broken(research_dir: Path, error: dict) -> bool:
     print(f"  [repair] WARN: clue chain broken — manual fix required: {error.get('detail')}", file=sys.stderr)
     return False
@@ -215,6 +223,9 @@ REPAIR_MAP = {
     "ERR_TASK_DUPLICATE_QUESTION":    repair_duplicate_question,
     "ERR_TASK_DUPLICATE_REPORT_PATH": repair_duplicate_report_path,
     "ERR_TASK_FILE_MISSING":          repair_task_file_missing,
+    "ERR_TASK_REPORT_SECTION_MISSING": repair_task_report_issue,
+    "ERR_TASK_REPORT_MISMATCH":       repair_task_report_issue,
+    "ERR_TASK_REPORT_THIN":           repair_task_report_issue,
     "ERR_DELTA_NO_FINDINGS":          repair_delta_no_findings,
     "ERR_CLUE_CHAIN_BROKEN":          repair_clue_chain_broken,
     "ERR_DEPTH_MISMATCH":             repair_depth_mismatch,
