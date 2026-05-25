@@ -8,8 +8,13 @@
  *   is reminded what phase it is in and what is forbidden right now.
  * - before_tool_call: block exploratory work when archive/state prerequisites
  *   are missing, incomplete, or still placeholder-filled.
- * - before_message_write: catch plain-text stop attempts before the archive is complete
- *   and immediately re-wake the same session with a trusted continuation nudge.
+ * - before_agent_finalize: (PRIMARY stop guard, 2026.5.18+) intercept finalization
+ *   via the native hook relay before Codex/Pi marks the run as done. Returns
+ *   { action: "revise" } to force the agent to continue if the archive is incomplete.
+ *   This hook must be registered so OpenClaw keeps hooks.Stop active for Codex.
+ * - before_message_write: (FALLBACK) catch plain-text stop attempts before the
+ *   archive is complete and immediately re-wake the same session with a trusted
+ *   continuation nudge. Still useful for the Pi embedded path.
  * - after_tool_call / agent_end: write audit markers for analysis and recovery.
  */
 
@@ -2020,6 +2025,72 @@ function register(api) {
     auditLog(rdir, { hook: "after_tool_call", role: sessionRole(ctx), tool: toolName, toolCallId, durationMs });
   });
 
+  // PRIMARY stop guard for Codex path (OpenClaw 2026.5.18+).
+  // Without this hook registered, OpenClaw sets hooks.Stop=[] which lets Codex
+  // stop without calling the relay at all, making before_message_write too late.
+  // For the Pi embedded path this is the cleanest interception point as well.
+  api.on("before_agent_finalize", async (_event, ctx) => {
+    const rdir = activeResearchDir(ctx);
+    if (!rdir) {
+      bindActiveResearch(ctx, null);
+      return;
+    }
+    bindActiveResearch(ctx, rdir);
+
+    const meta = readMeta(rdir);
+    if (!meta) {
+      return; // no meta — allow finalization
+    }
+
+    // Workers are allowed to finalize their individual sub-tasks
+    if (sessionRole(ctx) !== "orchestrator") {
+      return;
+    }
+
+    const stageInfo = detectArchiveStage(api, rdir, meta);
+    if (stageInfo.stage === "finalize") {
+      auditLog(rdir, {
+        hook: "before_agent_finalize",
+        action: "ALLOW",
+        stage: stageInfo.stage,
+        round: meta.current_round,
+      });
+      return; // archive is complete — allow normal finalization
+    }
+
+    const reason = buildContinuationEvent(stageInfo, meta);
+    const idempotencyKey = `deep-research-finalize:${stageInfo.stage}:${meta.current_round ?? 0}`;
+    updateCachedSession(sessionCacheKey(ctx), (current) => ({
+      ...current,
+      pendingToolContinuation: false,
+      lastContinuationKey: idempotencyKey,
+      lastContinuationAt: Date.now(),
+    }));
+    auditLog(rdir, {
+      hook: "before_agent_finalize",
+      action: "REVISE",
+      stage: stageInfo.stage,
+      round: meta.current_round,
+    });
+    // maxAttempts controls how many times we force "revise" per stage+round
+    // before giving up and letting the agent stop. The default when omitted is 1,
+    // which is far too tight for research tasks with many sub-steps. 12 gives
+    // enough room for a round with many tasks while still providing a safety
+    // ceiling if the agent is genuinely stuck (tool failures, loop, etc.).
+    return {
+      action: "revise",
+      reason,
+      retry: {
+        instruction: reason, // required — without this the retry is silently ignored
+        idempotencyKey,
+        maxAttempts: 12,
+      },
+    };
+  });
+
+  // FALLBACK stop guard — catches plain-text stop attempts in the Pi embedded
+  // path and through transcript mirroring. Still fires after before_agent_finalize
+  // in most scenarios; kept as a second line of defence.
   api.on("before_message_write", (event, ctx) => {
     const rdir = activeResearchDir(ctx);
     if (!rdir) {
@@ -2093,7 +2164,7 @@ module.exports = {
   name: "Deep Research Guard",
   description:
     "Enforces deep-research archive discipline with prompt guidance, tool gating, stop interception, and audit logging.",
-  version: "1.5.0",
+  version: "1.6.0",
   register,
   __testing: {
     detectArchiveStage,
