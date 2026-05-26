@@ -1573,7 +1573,7 @@ function maybeResumeUnfinishedResearch(api, ctx, rdir, meta, stageInfo, message)
     Number.isInteger(meta?.current_round) ? meta.current_round : "na",
   ].join(":");
 
-  queueContinuationWake(api, ctx, continuationEvent, contextKey, "wake");
+  const wakeQueued = queueContinuationWake(api, ctx, continuationEvent, contextKey, "wake");
   updateCachedSession(sessionCacheKey(ctx), (current) => ({
     ...current,
     pendingToolContinuation: false,
@@ -1587,11 +1587,16 @@ function maybeResumeUnfinishedResearch(api, ctx, rdir, meta, stageInfo, message)
     stage: stageInfo.stage,
     round: meta?.current_round,
     stopReason: trimToString(message?.stopReason) || null,
+    wakeQueued,
   });
 
   return {
     block: true,
     reason: continuationEvent,
+    // When the runtime wake API is unavailable, provide the continuation
+    // instruction directly so the runtime can inject it as context for the
+    // next turn instead of silently blocking with no follow-up.
+    continuationInstruction: wakeQueued ? undefined : continuationEvent,
   };
 }
 
@@ -1697,6 +1702,26 @@ function buildErrorRecoveryContinuationEvent(stageInfo, meta, event) {
   }
   lines.push(
     "Do not stop. Assess which tasks are still pending, retry or skip the failed one, and proceed.",
+  );
+  return lines.join(" ");
+}
+
+function buildSubagentSuccessContinuationEvent(stageInfo, meta, event) {
+  const taskId = trimToString(event?.taskId) || "";
+  const lines = [
+    `Deep-research guard: a sub-agent worker has completed successfully.`,
+  ];
+  if (taskId) {
+    lines.push(`Completed task: ${taskId}.`);
+  }
+  lines.push(
+    `The archive is at stage ${stageInfo.stage}. Research must continue.`,
+  );
+  if (Array.isArray(stageInfo.nextActions) && stageInfo.nextActions.length > 0) {
+    lines.push(`Next actions: ${stageInfo.nextActions.join("; ")}.`);
+  }
+  lines.push(
+    "Check remaining pending tasks. If all tasks for this round are done, proceed to the summarize stage. Do not stop until the archive reaches finalize.",
   );
   return lines.join(" ");
 }
@@ -2184,18 +2209,25 @@ function register(api) {
       stage: stageInfo.stage,
       round: meta.current_round,
     });
-    // maxAttempts controls how many times we force "revise" per stage+round
-    // before giving up and letting the agent stop. The default when omitted is 1,
-    // which is far too tight for research tasks with many sub-steps. 12 gives
-    // enough room for a round with many tasks while still providing a safety
-    // ceiling if the agent is genuinely stuck (tool failures, loop, etc.).
+    // maxAttempts is dynamic: scale with the number of tasks in the current round
+    // so that rounds with many sub-tasks don't exhaust the retry budget prematurely.
+    // Minimum 12, grows with task count (3 attempts per task gives enough room for
+    // dispatch + tool use + report writing per task).
+    const currentRound = Number.isInteger(meta?.current_round) ? meta.current_round : 0;
+    let taskCount = 0;
+    if (currentRound > 0) {
+      const { registryPath } = resolveRoundPaths(rdir, currentRound);
+      const registry = safeReadJson(registryPath);
+      taskCount = Array.isArray(registry?.tasks) ? registry.tasks.length : 0;
+    }
+    const dynamicMaxAttempts = Math.max(12, taskCount * 3);
     return {
       action: "revise",
       reason,
       retry: {
         instruction: reason, // required — without this the retry is silently ignored
         idempotencyKey,
-        maxAttempts: 12,
+        maxAttempts: dynamicMaxAttempts,
       },
     };
   });
@@ -2229,6 +2261,15 @@ function register(api) {
     );
     if (!interception) {
       return {};
+    }
+    // When the runtime wake API was unavailable, provide the continuation
+    // instruction so the runtime can inject it as the next system prompt turn,
+    // ensuring the agent knows what to do next even without a system event wake.
+    if (interception.continuationInstruction) {
+      return {
+        block: true,
+        continuationInstruction: interception.continuationInstruction,
+      };
     }
     return { block: true };
   });
@@ -2270,11 +2311,8 @@ function register(api) {
     const requesterSessionKey = trimToString(event?.requesterSessionKey) || trimToString(ctx?.requesterSessionKey);
     unlinkWorkerSession(targetSessionKey);
 
-    // --- Robustness: wake orchestrator if sub-agent failed/timed out ---
+    // --- Robustness: wake orchestrator on sub-agent completion (success or failure) ---
     const success = event?.success !== false && !trimToString(event?.error);
-    if (success) {
-      return; // sub-agent completed normally, nothing to do
-    }
 
     // Find the orchestrator's research dir from the requester session or workspace
     const orchestratorKey = requesterSessionKey || null;
@@ -2302,10 +2340,48 @@ function register(api) {
     const stageInfo = detectArchiveStage(api, rdir, meta);
     if (stageInfo.stage === "finalize") return;
 
-    // Record the failure in task_failures tracking
+    const taskId = trimToString(event?.taskId) || "";
+    const orchestratorCtx = {
+      sessionKey: orchestratorKey,
+      agentId: trimToString(ctx?.requesterAgentId) || trimToString(event?.requesterAgentId),
+    };
+
+    if (success) {
+      // Sub-agent completed normally — wake orchestrator to continue with next steps
+      const continuationEvent = buildSubagentSuccessContinuationEvent(stageInfo, meta, { taskId });
+      const contextKey = [
+        "deep-research-subagent-success",
+        stageInfo.stage,
+        meta.current_round ?? 0,
+        targetSessionKey || `subagent-${Date.now()}`,
+      ].join(":");
+
+      queueContinuationWake(api, orchestratorCtx, continuationEvent, contextKey, "deep-research-subagent-success");
+
+      if (orchestratorKey) {
+        updateCachedSession(orchestratorKey, (current) => ({
+          ...current,
+          pendingToolContinuation: false,
+          lastContinuationKey: contextKey,
+          lastContinuationAt: Date.now(),
+        }));
+      }
+
+      auditLog(rdir, {
+        hook: "subagent_ended",
+        action: "WAKE_ORCHESTRATOR",
+        trigger: "subagent_success",
+        stage: stageInfo.stage,
+        round: meta.current_round,
+        targetSessionKey,
+        taskId: taskId || null,
+      });
+      return;
+    }
+
+    // --- Failure path: record failure and wake orchestrator to handle it ---
     const retryConfig = getRetryConfig(api);
     const failureKey = targetSessionKey || `subagent-${Date.now()}`;
-    const taskId = trimToString(event?.taskId) || "";
     const errorText = trimToString(event?.error) || "sub-agent failed or timed out";
     const isRateLimit = looksLikeRateLimit(errorText);
 
@@ -2349,10 +2425,6 @@ function register(api) {
     ].join(":");
 
     // Wake the orchestrator via system event
-    const orchestratorCtx = {
-      sessionKey: orchestratorKey,
-      agentId: trimToString(ctx?.requesterAgentId) || trimToString(event?.requesterAgentId),
-    };
     queueContinuationWake(api, orchestratorCtx, continuationEvent, contextKey, "deep-research-subagent-failure");
 
     if (orchestratorKey) {
@@ -2396,6 +2468,7 @@ module.exports = {
     buildPostToolContinuationEvent,
     buildErrorRecoveryContinuationEvent,
     buildSubagentFailureContinuationEvent,
+    buildSubagentSuccessContinuationEvent,
     hasToolCall,
     isTerminalAssistantMessage,
     maybeResumeAfterToolIdle,
