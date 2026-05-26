@@ -2309,13 +2309,20 @@ function register(api) {
   api.on("subagent_ended", (event, ctx) => {
     const targetSessionKey = trimToString(event?.targetSessionKey) || trimToString(ctx?.childSessionKey);
     const requesterSessionKey = trimToString(event?.requesterSessionKey) || trimToString(ctx?.requesterSessionKey);
+
+    // Capture the sub-agent's cached session BEFORE unlinking — linkWorkerSession stored
+    // the orchestrator's researchDir and marker on this entry, so it's our most reliable
+    // fallback for finding rdir and orchestratorKey when the event fields are absent.
+    const targetCached = getCachedSession(targetSessionKey);
+
     unlinkWorkerSession(targetSessionKey);
 
     // --- Robustness: wake orchestrator on sub-agent completion (success or failure) ---
     const success = event?.success !== false && !trimToString(event?.error);
 
-    // Find the orchestrator's research dir from the requester session or workspace
-    const orchestratorKey = requesterSessionKey || null;
+    // Find the orchestrator's research dir from the requester session or workspace.
+    // Try multiple sources in order of reliability.
+    let orchestratorKey = requesterSessionKey || null;
     let rdir = null;
     if (orchestratorKey) {
       const cached = getCachedSession(orchestratorKey);
@@ -2329,6 +2336,22 @@ function register(api) {
         if (fs.existsSync(markerPath)) {
           const payload = safeReadJson(markerPath);
           rdir = trimToString(payload?.research_dir) || null;
+          if (!orchestratorKey) {
+            orchestratorKey = trimToString(payload?.owner_session_key) || null;
+          }
+        }
+      }
+    }
+    if (!rdir && targetCached) {
+      // Final fallback: the sub-agent's own cache entry carries the orchestrator's
+      // researchDir and marker (copied by linkWorkerSession), so we can recover
+      // even when the requester key and workspaceDir are both unavailable.
+      rdir = targetCached.researchDir || null;
+      if (!rdir && targetCached.marker && fs.existsSync(targetCached.marker)) {
+        const payload = safeReadJson(targetCached.marker);
+        rdir = trimToString(payload?.research_dir) || null;
+        if (!orchestratorKey) {
+          orchestratorKey = trimToString(payload?.owner_session_key) || null;
         }
       }
     }
