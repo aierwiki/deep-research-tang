@@ -125,9 +125,9 @@ python scripts/openclaw_deep_research_session.py activate \
 
 - `00_research_brief.md`：记录用户原始问题、研究目标、约束条件、预期交付物
 - `00_meta.json`：记录机器可读元数据，至少包含 `topic`、`target_depth`、`depth_mode`、`current_round`、`status`
-- 若仓库中存在 `deep-research/scripts/check_deep_research_archive.py`，初始化完成后应立即运行一次检查，确认归档骨架有效
+- 若仓库中存在 `scripts/check_deep_research_archive.py`，初始化完成后应立即运行一次检查，确认归档骨架有效
 
-如果仓库中存在 `deep-research/scripts/init_deep_research_archive.py`，应优先调用该脚本创建研究目录和模板文件，而不是手工拼装目录结构。只有在脚本不存在或确实无法执行时，才允许手工初始化。
+如果仓库中存在 `scripts/init_deep_research_archive.py`，应优先调用该脚本创建研究目录和模板文件，而不是手工拼装目录结构。只有在脚本不存在或确实无法执行时，才允许手工初始化。
 
 `00_meta.json` 推荐结构如下：
 
@@ -365,13 +365,13 @@ research_20260411_api-gateway/
 如果框架或环境支持脚本执行，建议在每轮完成后运行检查器，例如：
 
 ```bash
-python deep-research/scripts/check_deep_research_archive.py --research-dir research_20260411_api-gateway --strict
+python scripts/check_deep_research_archive.py --research-dir research_20260411_api-gateway --strict
 ```
 
 如果仓库提供了初始化脚本，建议优先用它创建研究骨架，例如：
 
 ```bash
-python deep-research/scripts/init_deep_research_archive.py --topic api-gateway --question "是否应该引入统一 API gateway" --target-depth 5 --depth-mode user-specified
+python scripts/init_deep_research_archive.py --topic api-gateway --question "是否应该引入统一 API gateway" --target-depth 5 --depth-mode user-specified
 ```
 
 ---

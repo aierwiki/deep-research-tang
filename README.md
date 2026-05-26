@@ -123,7 +123,7 @@ research_20260411_api-gateway/
 
 ## 模板
 
-仓库内提供了一组模板文件，放在 [deep-research/templates](deep-research/templates) 中。建议在开始研究时复制一份，然后按轮次填写。
+仓库内提供了一组模板文件，放在 [templates](templates) 中。建议在开始研究时复制一份，然后按轮次填写。
 
 模板覆盖：
 
@@ -194,12 +194,16 @@ deep-research/
 │   ├── deep_research_state_machine.py   # 状态机与 meta 读写
 │   ├── init_deep_research_archive.py    # 初始化脚手架
 │   ├── check_deep_research_archive.py   # 严格归档检查器
-│   └── repair_deep_research_archive.py  # 自动修复循环
+│   ├── repair_deep_research_archive.py  # 自动修复循环
+│   ├── openclaw_deep_research_session.py # 会话生命周期脚本（start/activate/advance-round/finalize）
+│   └── install_openclaw_deep_research.sh # 一键写入 OpenClaw 配置
 ├── openclaw-plugin/
 │   ├── openclaw.plugin.json  # OpenClaw runtime plugin manifest
 │   ├── package.json          # OpenClaw 插件包元数据
 │   ├── README.md             # OpenClaw 插件接入说明
-│   └── index.js              # before_prompt_build / before_tool_call / agent_end 门禁
+│   └── index.js              # before_agent_finalize / before_prompt_build / before_tool_call /
+│                             #   before_message_write / after_tool_call / agent_end 等 hook 门禁
+│                             #   + deep_research_session 工具注册
 ├── tests/                # 端到端测试
 ├── examples/             # 检查器通过/失败示例
 ├── templates/            # 归档模板
@@ -208,15 +212,14 @@ deep-research/
 
 ## OpenClaw 插件策略
 
-OpenClaw 没有一个“插件直接给当前 run 追加一条 user message 并原地续跑”的专用 API，但它提供了足够稳定的两段式机制：`before_message_write` 用来识别“assistant 无 tool use 的收工消息”，`system event + heartbeat wake` 用来把同一 session 再唤醒一轮。因此本仓库里的插件采用如下组合：
+插件（v1.6.0+）在以下几个关键收口点精确干预，目标是"流程未满足时 Agent 既拿不到自然收工的落点，也会被推回当前研究上下文继续干活"：
 
+- `before_agent_finalize`（**主要止停门禁**，2026.5.18+ 必须注册）：在 Codex/Pi agent 准备结束 run 时拦截。若归档尚未到达 `finalize` 阶段，返回 `{ action: "revise" }` 强制 agent 继续。这是 Codex 路径下唯一可靠的拦截点——只有注册此 hook，OpenClaw 才会把 `hooks.Stop` 指向中继命令而非置空
 - `before_prompt_build`：按当前归档阶段注入最小执行约束
 - `before_tool_call`：在规划未完成、总结未完成、检查失败等状态下阻断探索型工具
-- `before_message_write`：如果检测到 assistant 想以纯文本消息收工，但归档状态还没到 `finalize`，则阻断这次收工，并补一条系统继续指令给同一 session，然后立即唤醒继续执行
-- `after_tool_call`：记录工具审计日志
-- `agent_end`：记录未完成退出，便于恢复和统计
-
-这样做的目标不是做一个臃肿的大总闸门，而是在最关键的几个收口点上精确干预：流程未满足时，Agent 既拿不到“自然收工”的落点，也会被推回当前研究上下文继续干活。
+- `before_message_write`（**备用止停门禁**）：兜底拦截 Pi 嵌入式路径的纯文本收工消息；如归档未完成则阻断并通过 `system event + heartbeat wake` 唤醒同一 session 继续执行
+- `after_tool_call`：解析会话信号、更新会话绑定、记录工具审计日志
+- `agent_end`：备用续跑触发 + 记录未完成退出，便于恢复和统计
 
 另外，当前版本已经显式区分两种会话角色：
 
@@ -227,7 +230,7 @@ worker 不再被要求“必须把整个研究做到 finalize 才能停”，否
 
 ### OpenClaw 安装提示
 
-将 [openclaw-plugin](/Users/tangyubin/project/gitee/deep-research/openclaw-plugin) 目录加入 OpenClaw 的 `plugins.load.paths`，并在 `plugins.allow` 中允许 `deep-research-guard`。
+将 [openclaw-plugin](openclaw-plugin) 目录加入 OpenClaw 的 `plugins.load.paths`，并在 `plugins.allow` 中允许 `deep-research-guard`。
 
 当前版本不再在安装阶段绑定某一个固定 `researchDir`。正确模型是：
 
@@ -235,7 +238,7 @@ worker 不再被要求“必须把整个研究做到 finalize 才能停”，否
 - 当用户真的发起一次深度研究时，由 skill 内的会话脚本创建或绑定本次研究目录
 - plugin 只对“当前活跃研究会话”生效，而不是对所有普通对话全局生效
 
-详细示例见 [openclaw-plugin/README.md](/Users/tangyubin/project/gitee/deep-research/openclaw-plugin/README.md)。
+详细示例见 [openclaw-plugin/README.md](openclaw-plugin/README.md)。
 
 如果你想直接一键写入 OpenClaw 配置，可以运行：
 
@@ -245,7 +248,7 @@ bash scripts/install_openclaw_deep_research.sh
 
 这个脚本会自动：
 
-- 把 [openclaw-plugin](/Users/tangyubin/project/gitee/deep-research/openclaw-plugin) 加入 `plugins.load.paths`
+- 把 [openclaw-plugin](openclaw-plugin) 加入 `plugins.load.paths`
 - 把 `deep-research-guard` 加入 `plugins.allow`
 - 启用 `plugins.entries.deep-research-guard.enabled`
 - 写入 `scriptsDir`、`strict`
