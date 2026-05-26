@@ -26,6 +26,41 @@ const { execFileSync } = require("child_process");
 
 const ACTIVE_SESSIONS = new Map();
 
+// --- Robustness: retry and fault-tolerance defaults ---
+const DEFAULT_SUBAGENT_MAX_RETRIES = 3;
+const DEFAULT_RETRY_BASE_DELAY_MS = 2000;
+const DEFAULT_RETRY_MAX_DELAY_MS = 30000;
+const RATE_LIMIT_ERROR_PATTERNS = [
+  /rate.?limit/i,
+  /too many requests/i,
+  /429/,
+  /throttl/i,
+  /quota/i,
+];
+
+function getRetryConfig(api) {
+  const cfg = pluginConfig(api);
+  return {
+    maxRetries: Number(cfg.subagentMaxRetries) || DEFAULT_SUBAGENT_MAX_RETRIES,
+    baseDelayMs: Number(cfg.retryBaseDelayMs) || DEFAULT_RETRY_BASE_DELAY_MS,
+    maxDelayMs: Number(cfg.retryMaxDelayMs) || DEFAULT_RETRY_MAX_DELAY_MS,
+  };
+}
+
+function looksLikeRateLimit(errorText) {
+  if (!errorText) return false;
+  const text = String(errorText);
+  return RATE_LIMIT_ERROR_PATTERNS.some((pattern) => pattern.test(text));
+}
+
+function computeRetryDelay(attempt, baseDelayMs, maxDelayMs, isRateLimit) {
+  const base = isRateLimit ? baseDelayMs * 3 : baseDelayMs;
+  const delay = Math.min(base * Math.pow(2, attempt - 1), maxDelayMs);
+  // Add jitter (±25%)
+  const jitter = delay * 0.25 * (Math.random() * 2 - 1);
+  return Math.max(100, Math.round(delay + jitter));
+}
+
 const PLACEHOLDER_PATTERNS = [
   "replace-with",
   "action-1",
@@ -1358,12 +1393,22 @@ function buildStagePrompt(stageInfo, meta) {
       "Do not declare the research complete unless the archive state reaches finalize.",
     );
   }
+  if (stageInfo.stage === "plan" || stageInfo.stage === "advance") {
+    lines.push(
+      "Dynamic task planning: design this round's tasks based on what was actually discovered so far, not on a pre-fixed plan. " +
+      "Each round should adapt its exploration directions to the latest findings and gaps.",
+    );
+  }
   if (stageInfo.stage === "execute") {
     lines.push(
       "For time-sensitive facts, prefer fresher evidence, record absolute dates, and distinguish event dates from publish dates.",
     );
     lines.push(
       "Cross-check important claims with multiple sources before treating them as settled evidence.",
+    );
+    lines.push(
+      "Fault tolerance: if a sub-task fails after retries (max 3), write a partial task report noting the failure reason, " +
+      "then continue with remaining tasks. Missing info from failed tasks can be supplemented in a later round.",
     );
   }
   if (stageInfo.stage === "synthesize") {
@@ -1401,6 +1446,9 @@ function buildWorkerPrompt(stageInfo, meta) {
   if (stageInfo.stage === "execute") {
     lines.push(
       "If the task is time-sensitive, record exact dates and cross-check key facts instead of trusting the first source.",
+    );
+    lines.push(
+      "If you encounter rate-limiting or transient errors, wait briefly and retry up to 3 times before giving up.",
     );
   }
   return lines.join("\n");
@@ -1575,28 +1623,30 @@ function maybeResumeAfterToolIdle(api, ctx, rdir, meta, stageInfo, event) {
   if (sessionRole(ctx) !== "orchestrator") {
     return null;
   }
-  if (event?.success === false || trimToString(event?.error)) {
-    return null;
-  }
+  // On error/failure, still attempt recovery wake instead of silently giving up.
+  // The orchestrator needs to know something failed so it can retry or skip.
+  const isErrorEvent = event?.success === false || !!trimToString(event?.error);
 
   const key = sessionCacheKey(ctx);
   const cached = getCachedSessionState(key);
-  if (!cached?.pendingToolContinuation || !trimToString(cached?.lastToolCallId)) {
+  if (!isErrorEvent && (!cached?.pendingToolContinuation || !trimToString(cached?.lastToolCallId))) {
     return null;
   }
 
   const contextKey = [
     "deep-research-post-tool",
-    stageInfo.stage,
+    isErrorEvent ? "error" : stageInfo.stage,
     Number.isInteger(meta?.current_round) ? meta.current_round : "na",
-    trimToString(cached.lastToolCallId),
+    trimToString(cached?.lastToolCallId) || String(Date.now()),
   ].join(":");
-  if (trimToString(cached.lastContinuationKey) === contextKey) {
+  if (cached && trimToString(cached.lastContinuationKey) === contextKey) {
     return null;
   }
 
-  const continuationEvent = buildPostToolContinuationEvent(stageInfo, meta, cached);
-  queueContinuationWake(api, ctx, continuationEvent, contextKey, "deep-research-post-tool");
+  const continuationEvent = isErrorEvent
+    ? buildErrorRecoveryContinuationEvent(stageInfo, meta, event)
+    : buildPostToolContinuationEvent(stageInfo, meta, cached);
+  queueContinuationWake(api, ctx, continuationEvent, contextKey, isErrorEvent ? "deep-research-error-recovery" : "deep-research-post-tool");
   updateCachedSession(key, (current) => ({
     ...current,
     pendingToolContinuation: false,
@@ -1606,18 +1656,80 @@ function maybeResumeAfterToolIdle(api, ctx, rdir, meta, stageInfo, event) {
 
   auditLog(rdir, {
     hook: "agent_end",
-    action: "AUTO_RESUME",
-    trigger: "post_tool_idle",
+    action: isErrorEvent ? "ERROR_RECOVERY" : "AUTO_RESUME",
+    trigger: isErrorEvent ? "error_event" : "post_tool_idle",
     stage: stageInfo.stage,
     round: meta?.current_round,
-    tool: trimToString(cached.lastToolName) || null,
-    toolCallId: trimToString(cached.lastToolCallId) || null,
+    tool: trimToString(cached?.lastToolName) || null,
+    toolCallId: trimToString(cached?.lastToolCallId) || null,
+    error: isErrorEvent ? trimToString(event?.error) : null,
   });
   return {
     queued: true,
     contextKey,
     reason: continuationEvent,
   };
+}
+
+function buildErrorRecoveryContinuationEvent(stageInfo, meta, event) {
+  const errorText = trimToString(event?.error) || "unknown error";
+  const isRateLimit = looksLikeRateLimit(errorText);
+  const lines = [
+    `Deep-research guard detected a sub-agent or tool failure: ${errorText}.`,
+  ];
+  if (isRateLimit) {
+    lines.push(
+      "This appears to be a rate-limiting error. Wait briefly before retrying the failed task.",
+    );
+  }
+  lines.push(
+    `The archive is still at stage ${stageInfo.stage}, so the research must continue.`,
+  );
+  lines.push(
+    "Fault-tolerance policy: if a sub-task failed after retries, mark it as failed in the task report with the error reason, " +
+    "then continue with the remaining tasks. Missing information from failed tasks can be recovered in a later round via new tasks.",
+  );
+  if (meta && Number.isInteger(meta.current_round)) {
+    lines.push(`Current round: ${meta.current_round}.`);
+  }
+  if (Array.isArray(stageInfo.nextActions) && stageInfo.nextActions.length > 0) {
+    lines.push(`Continue with: ${stageInfo.nextActions.join("; ")}.`);
+  }
+  lines.push(
+    "Do not stop. Assess which tasks are still pending, retry or skip the failed one, and proceed.",
+  );
+  return lines.join(" ");
+}
+
+function buildSubagentFailureContinuationEvent(stageInfo, meta, event) {
+  const errorText = trimToString(event?.error) || trimToString(event?.reason) || "sub-agent ended unexpectedly";
+  const taskId = trimToString(event?.taskId) || "";
+  const isRateLimit = looksLikeRateLimit(errorText);
+  const lines = [
+    `Deep-research guard: a sub-agent worker has failed or timed out.`,
+  ];
+  if (taskId) {
+    lines.push(`Failed task: ${taskId}.`);
+  }
+  lines.push(`Error: ${errorText}.`);
+  if (isRateLimit) {
+    lines.push(
+      "This looks like a rate-limit/throttling error. Consider waiting before retrying.",
+    );
+  }
+  lines.push(
+    `The archive is at stage ${stageInfo.stage}. Research must continue.`,
+  );
+  lines.push(
+    "Fault-tolerance: if the task has been retried " + DEFAULT_SUBAGENT_MAX_RETRIES + " times already, " +
+    "write a partial task report noting the failure, then continue with remaining tasks. " +
+    "The missing information can be recovered in a subsequent round.",
+  );
+  if (Array.isArray(stageInfo.nextActions) && stageInfo.nextActions.length > 0) {
+    lines.push(`Next actions: ${stageInfo.nextActions.join("; ")}.`);
+  }
+  lines.push("Do not stop until the archive reaches finalize.");
+  return lines.join(" ");
 }
 
 function extractApplyPatchTargets(patchText) {
@@ -2155,7 +2267,114 @@ function register(api) {
 
   api.on("subagent_ended", (event, ctx) => {
     const targetSessionKey = trimToString(event?.targetSessionKey) || trimToString(ctx?.childSessionKey);
+    const requesterSessionKey = trimToString(event?.requesterSessionKey) || trimToString(ctx?.requesterSessionKey);
     unlinkWorkerSession(targetSessionKey);
+
+    // --- Robustness: wake orchestrator if sub-agent failed/timed out ---
+    const success = event?.success !== false && !trimToString(event?.error);
+    if (success) {
+      return; // sub-agent completed normally, nothing to do
+    }
+
+    // Find the orchestrator's research dir from the requester session or workspace
+    const orchestratorKey = requesterSessionKey || null;
+    let rdir = null;
+    if (orchestratorKey) {
+      const cached = getCachedSession(orchestratorKey);
+      rdir = cached?.researchDir || null;
+    }
+    if (!rdir) {
+      // Try workspace-based lookup
+      const workspaceDir = workspaceDirFromCtx(ctx);
+      if (workspaceDir) {
+        const markerPath = path.join(workspaceDir, ".deep-research", "active.json");
+        if (fs.existsSync(markerPath)) {
+          const payload = safeReadJson(markerPath);
+          rdir = trimToString(payload?.research_dir) || null;
+        }
+      }
+    }
+    if (!rdir) return;
+
+    const meta = readMeta(rdir);
+    if (!meta) return;
+
+    const stageInfo = detectArchiveStage(api, rdir, meta);
+    if (stageInfo.stage === "finalize") return;
+
+    // Record the failure in task_failures tracking
+    const retryConfig = getRetryConfig(api);
+    const failureKey = targetSessionKey || `subagent-${Date.now()}`;
+    const taskId = trimToString(event?.taskId) || "";
+    const errorText = trimToString(event?.error) || "sub-agent failed or timed out";
+    const isRateLimit = looksLikeRateLimit(errorText);
+
+    // Track retries in the session cache for the orchestrator
+    if (orchestratorKey) {
+      updateCachedSession(orchestratorKey, (current) => {
+        const failures = current.taskFailures || {};
+        const existing = failures[failureKey] || { count: 0, taskId, errors: [] };
+        existing.count += 1;
+        existing.errors.push({ error: errorText, at: Date.now() });
+        existing.taskId = taskId || existing.taskId;
+        existing.isRateLimit = isRateLimit;
+        failures[failureKey] = existing;
+        return {
+          ...current,
+          taskFailures: failures,
+          lastSubagentFailure: {
+            sessionKey: targetSessionKey,
+            taskId,
+            error: errorText,
+            isRateLimit,
+            retryCount: existing.count,
+            maxRetries: retryConfig.maxRetries,
+            at: Date.now(),
+          },
+        };
+      });
+    }
+
+    // Build continuation event to wake orchestrator
+    const continuationEvent = buildSubagentFailureContinuationEvent(stageInfo, meta, {
+      error: errorText,
+      taskId,
+      isRateLimit,
+    });
+    const contextKey = [
+      "deep-research-subagent-failure",
+      stageInfo.stage,
+      meta.current_round ?? 0,
+      failureKey,
+    ].join(":");
+
+    // Wake the orchestrator via system event
+    const orchestratorCtx = {
+      sessionKey: orchestratorKey,
+      agentId: trimToString(ctx?.requesterAgentId) || trimToString(event?.requesterAgentId),
+    };
+    queueContinuationWake(api, orchestratorCtx, continuationEvent, contextKey, "deep-research-subagent-failure");
+
+    if (orchestratorKey) {
+      updateCachedSession(orchestratorKey, (current) => ({
+        ...current,
+        pendingToolContinuation: false,
+        lastContinuationKey: contextKey,
+        lastContinuationAt: Date.now(),
+      }));
+    }
+
+    auditLog(rdir, {
+      hook: "subagent_ended",
+      action: "WAKE_ORCHESTRATOR",
+      trigger: "subagent_failure",
+      stage: stageInfo.stage,
+      round: meta.current_round,
+      targetSessionKey,
+      taskId: taskId || null,
+      error: errorText,
+      isRateLimit,
+    });
   });
 }
 
@@ -2164,7 +2383,7 @@ module.exports = {
   name: "Deep Research Guard",
   description:
     "Enforces deep-research archive discipline with prompt guidance, tool gating, stop interception, and audit logging.",
-  version: "1.6.0",
+  version: "1.7.0",
   register,
   __testing: {
     detectArchiveStage,
@@ -2175,6 +2394,8 @@ module.exports = {
     buildWorkerPrompt,
     buildContinuationEvent,
     buildPostToolContinuationEvent,
+    buildErrorRecoveryContinuationEvent,
+    buildSubagentFailureContinuationEvent,
     hasToolCall,
     isTerminalAssistantMessage,
     maybeResumeAfterToolIdle,
@@ -2199,6 +2420,9 @@ module.exports = {
     unlinkWorkerSession,
     markToolActivity,
     clearPendingToolContinuation,
+    getRetryConfig,
+    looksLikeRateLimit,
+    computeRetryDelay,
     resetGuardActivation: () => ACTIVE_SESSIONS.clear(),
     readActiveSession,
   },
