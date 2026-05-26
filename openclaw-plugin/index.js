@@ -261,14 +261,29 @@ function runChecker(api, rdir, opts = {}) {
   }
 }
 
+function appendJsonLine(logPath, entry) {
+  const line = JSON.stringify({ ts: new Date().toISOString(), ...entry }) + "\n";
+  try {
+    fs.mkdirSync(path.dirname(logPath), { recursive: true });
+    fs.appendFileSync(logPath, line);
+  } catch (_) {}
+}
+
 /** Append a line to the audit log inside the research dir. */
 function auditLog(rdir, entry) {
   if (!rdir) return;
-  const logPath = path.join(rdir, "audit.log");
-  const line = JSON.stringify({ ts: new Date().toISOString(), ...entry }) + "\n";
-  try {
-    fs.appendFileSync(logPath, line);
-  } catch (_) {}
+  appendJsonLine(path.join(rdir, "audit.log"), entry);
+}
+
+/** Append verbose troubleshooting logs for session wake/resume diagnosis. */
+function guardDebugLog(ctx, rdir, entry) {
+  const workspaceDir = workspaceDirFromCtx(ctx);
+  if (workspaceDir) {
+    appendJsonLine(path.join(workspaceDir, ".deep-research", "guard-debug.log"), entry);
+  }
+  if (rdir) {
+    appendJsonLine(path.join(rdir, "debug", "guard-debug.log"), entry);
+  }
 }
 
 function fileLooksPlaceholder(filePath) {
@@ -2309,6 +2324,16 @@ function register(api) {
   api.on("subagent_ended", (event, ctx) => {
     const targetSessionKey = trimToString(event?.targetSessionKey) || trimToString(ctx?.childSessionKey);
     const requesterSessionKey = trimToString(event?.requesterSessionKey) || trimToString(ctx?.requesterSessionKey);
+    guardDebugLog(ctx, null, {
+      hook: "subagent_ended",
+      action: "RECEIVED",
+      targetSessionKey: targetSessionKey || null,
+      requesterSessionKey: requesterSessionKey || null,
+      taskId: trimToString(event?.taskId) || null,
+      success: event?.success !== false && !trimToString(event?.error),
+      error: trimToString(event?.error) || null,
+      hasWorkspaceDir: !!workspaceDirFromCtx(ctx),
+    });
 
     // Capture the sub-agent's cached session BEFORE unlinking — linkWorkerSession stored
     // the orchestrator's researchDir and marker on this entry, so it's our most reliable
@@ -2324,9 +2349,13 @@ function register(api) {
     // Try multiple sources in order of reliability.
     let orchestratorKey = requesterSessionKey || null;
     let rdir = null;
+    let rdirSource = null;
     if (orchestratorKey) {
       const cached = getCachedSession(orchestratorKey);
       rdir = cached?.researchDir || null;
+      if (rdir) {
+        rdirSource = "orchestrator_cache";
+      }
     }
     if (!rdir) {
       // Try workspace-based lookup
@@ -2336,6 +2365,9 @@ function register(api) {
         if (fs.existsSync(markerPath)) {
           const payload = safeReadJson(markerPath);
           rdir = trimToString(payload?.research_dir) || null;
+          if (rdir) {
+            rdirSource = "workspace_active_marker";
+          }
           if (!orchestratorKey) {
             orchestratorKey = trimToString(payload?.owner_session_key) || null;
           }
@@ -2347,21 +2379,64 @@ function register(api) {
       // researchDir and marker (copied by linkWorkerSession), so we can recover
       // even when the requester key and workspaceDir are both unavailable.
       rdir = targetCached.researchDir || null;
+      if (rdir) {
+        rdirSource = "target_cache";
+      }
       if (!rdir && targetCached.marker && fs.existsSync(targetCached.marker)) {
         const payload = safeReadJson(targetCached.marker);
         rdir = trimToString(payload?.research_dir) || null;
+        if (rdir) {
+          rdirSource = "target_cached_marker";
+        }
         if (!orchestratorKey) {
           orchestratorKey = trimToString(payload?.owner_session_key) || null;
         }
       }
     }
-    if (!rdir) return;
+    guardDebugLog(ctx, rdir, {
+      hook: "subagent_ended",
+      action: "RESOLVE_CONTEXT",
+      targetSessionKey: targetSessionKey || null,
+      requesterSessionKey: requesterSessionKey || null,
+      orchestratorKey: orchestratorKey || null,
+      resolvedRdir: rdir || null,
+      rdirSource: rdirSource || null,
+      hadTargetCache: !!targetCached,
+      hadTargetCacheMarker: !!trimToString(targetCached?.marker),
+    });
+    if (!rdir) {
+      guardDebugLog(ctx, null, {
+        hook: "subagent_ended",
+        action: "DROP_WAKE",
+        reason: "missing_research_dir",
+        targetSessionKey: targetSessionKey || null,
+        requesterSessionKey: requesterSessionKey || null,
+        orchestratorKey: orchestratorKey || null,
+      });
+      return;
+    }
 
     const meta = readMeta(rdir);
-    if (!meta) return;
+    if (!meta) {
+      guardDebugLog(ctx, rdir, {
+        hook: "subagent_ended",
+        action: "DROP_WAKE",
+        reason: "missing_meta",
+        targetSessionKey: targetSessionKey || null,
+      });
+      return;
+    }
 
     const stageInfo = detectArchiveStage(api, rdir, meta);
-    if (stageInfo.stage === "finalize") return;
+    if (stageInfo.stage === "finalize") {
+      guardDebugLog(ctx, rdir, {
+        hook: "subagent_ended",
+        action: "SKIP_WAKE",
+        reason: "already_finalize_stage",
+        targetSessionKey: targetSessionKey || null,
+      });
+      return;
+    }
 
     const taskId = trimToString(event?.taskId) || "";
     const orchestratorCtx = {
@@ -2379,7 +2454,7 @@ function register(api) {
         targetSessionKey || `subagent-${Date.now()}`,
       ].join(":");
 
-      queueContinuationWake(api, orchestratorCtx, continuationEvent, contextKey, "deep-research-subagent-success");
+      const wakeQueued = queueContinuationWake(api, orchestratorCtx, continuationEvent, contextKey, "deep-research-subagent-success");
 
       if (orchestratorKey) {
         updateCachedSession(orchestratorKey, (current) => ({
@@ -2398,6 +2473,15 @@ function register(api) {
         round: meta.current_round,
         targetSessionKey,
         taskId: taskId || null,
+      });
+      guardDebugLog(ctx, rdir, {
+        hook: "subagent_ended",
+        action: "WAKE_ATTEMPT",
+        trigger: "subagent_success",
+        contextKey,
+        targetSessionKey: targetSessionKey || null,
+        orchestratorKey: orchestratorKey || null,
+        wakeQueued,
       });
       return;
     }
@@ -2448,7 +2532,7 @@ function register(api) {
     ].join(":");
 
     // Wake the orchestrator via system event
-    queueContinuationWake(api, orchestratorCtx, continuationEvent, contextKey, "deep-research-subagent-failure");
+    const wakeQueued = queueContinuationWake(api, orchestratorCtx, continuationEvent, contextKey, "deep-research-subagent-failure");
 
     if (orchestratorKey) {
       updateCachedSession(orchestratorKey, (current) => ({
@@ -2467,6 +2551,17 @@ function register(api) {
       round: meta.current_round,
       targetSessionKey,
       taskId: taskId || null,
+      error: errorText,
+      isRateLimit,
+    });
+    guardDebugLog(ctx, rdir, {
+      hook: "subagent_ended",
+      action: "WAKE_ATTEMPT",
+      trigger: "subagent_failure",
+      contextKey,
+      targetSessionKey: targetSessionKey || null,
+      orchestratorKey: orchestratorKey || null,
+      wakeQueued,
       error: errorText,
       isRateLimit,
     });

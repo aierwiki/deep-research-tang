@@ -10,6 +10,7 @@ OpenClaw runtime plugin for enforcing the `deep-research` archive workflow.
 - Enqueues a trusted continuation message and wakes the same session to keep the research moving
 - Still allows archive-maintenance commands such as checker/repair scripts
 - Records audit events for tool usage and unfinished exits
+- Writes detailed wake diagnostics to JSONL logs for post-mortem debugging
 
 ## Requirements
 
@@ -139,3 +140,13 @@ Worker sessions are treated differently on purpose:
 - they may finish normally after completing their assigned task
 - they may write only registered task report files under the current `round_N/tasks/` directory
 - they may not write `00_meta.json`, seed clues, task registry, round summary, delta report, or `final_report.md`
+
+## Troubleshooting Logs
+
+For wake/resume debugging, the plugin writes newline-delimited JSON logs to:
+
+- Workspace-level (best for missing-research-dir cases): `<workspace>/.deep-research/guard-debug.log`
+- Research-level (best for per-archive replay): `<research_dir>/debug/guard-debug.log`
+- Existing audit trail: `<research_dir>/audit.log`
+
+When a similar issue happens again, copy these log files and share them directly.
