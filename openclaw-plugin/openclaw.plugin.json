@@ -2,7 +2,7 @@
   "id": "deep-research-guard",
   "name": "Deep Research Guard",
   "description": "Enforces deep-research archive discipline with prompt guidance, tool gating, stop interception, and audit logging.",
-  "version": "1.5.0",
+  "version": "1.7.0",
   "configSchema": {
     "type": "object",
     "properties": {
@@ -11,6 +11,25 @@
       },
       "strict": {
         "type": "boolean"
+      },
+      "subagentMaxRetries": {
+        "type": "integer",
+        "minimum": 0,
+        "maximum": 10,
+        "default": 3,
+        "description": "Maximum number of retries for a failed sub-agent task before marking it as failed and continuing."
+      },
+      "retryBaseDelayMs": {
+        "type": "integer",
+        "minimum": 100,
+        "default": 2000,
+        "description": "Base delay in ms before retrying a failed sub-agent task. Exponential backoff is applied."
+      },
+      "retryMaxDelayMs": {
+        "type": "integer",
+        "minimum": 1000,
+        "default": 30000,
+        "description": "Maximum delay in ms for retry backoff."
       }
     },
     "additionalProperties": true
