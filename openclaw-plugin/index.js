@@ -277,7 +277,15 @@ function auditLog(rdir, entry) {
 
 /** Append verbose troubleshooting logs for session wake/resume diagnosis. */
 function guardDebugLog(ctx, rdir, entry) {
-  const workspaceDir = workspaceDirFromCtx(ctx);
+  let workspaceDir = workspaceDirFromCtx(ctx);
+  if (!workspaceDir && rdir) {
+    const parent = path.resolve(rdir, "..");
+    try {
+      if (fs.existsSync(path.join(parent, "AGENTS.md")) || fs.existsSync(path.join(parent, "MEMORY.md"))) {
+        workspaceDir = parent;
+      }
+    } catch (_) {}
+  }
   if (workspaceDir) {
     appendJsonLine(path.join(workspaceDir, ".deep-research", "guard-debug.log"), entry);
   }
@@ -1526,8 +1534,10 @@ function queueContinuationWake(api, ctx, text, contextKey, reason = "wake") {
   try {
     const runtimeSystem = api?.runtime?.system;
     if (runtimeSystem?.enqueueSystemEvent && sessionKey) {
-      runtimeSystem.enqueueSystemEvent(text, { sessionKey, contextKey });
-      queued = true;
+      const enqueued = runtimeSystem.enqueueSystemEvent(text, { sessionKey, contextKey });
+      if (enqueued !== false) {
+        queued = true;
+      }
     }
     if (runtimeSystem?.requestHeartbeatNow && (sessionKey || agentId)) {
       runtimeSystem.requestHeartbeatNow({
