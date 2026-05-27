@@ -445,9 +445,16 @@ OpenClaw 的子代理是 **push-based** 架构：spawn 后子代理在后台运�
    - 有缺失的文件则标记为失败，可在下一批重试
    - 全部确认后才能进入 round summary 和 delta report 阶段
 
-4. **多批次执行**：如果一轮 task 数量较多（>2 个），分批次 spawn（每批 2 个），每批都遵循 spawn → sessions_yield → 验证文件的流程。
+4. **被唤醒后仍有子代理在运行，必须再次 yield**：如果某个子代理完成（成功或失败）唤醒了主 agent，但主 agent 检查发现同一批次中**还有其他子代理未完成**，则主 agent 在处理完已完成子代理的结果后，**必须再次调用 `sessions_yield`** 等待剩余 completion event 到达。不能因为"自己没有新的 spawn"就跳过 yield——研究尚未完成，主动挂起等待是唯一正确行为。
 
-5. **绝对禁止**：
+```json
+{ "action": "sessions_yield", "message": "等待剩余子代理完成" }
+```
+
+5. **多批次执行**：如果一轮 task 数量较多（>2 个），分批次 spawn（每批 2 个），每批都遵循 spawn → sessions_yield → 验证文件的流程。
+
+6. **绝对禁止**：
    - ❌ spawn 后不调用 sessions_yield 就结束 turn
+   - ❌ 被唤醒后发现仍有子代理在运行却不再次 yield 就结束 turn
    - ❌ 用 exec sleep 或 process poll 轮询子代理状态
    - ❌ 用 sessions_list 轮询子代理状态
