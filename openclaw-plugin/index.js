@@ -1580,6 +1580,107 @@ function markToolActivity(ctx, event) {
   }));
 }
 
+// --- Auto-yield enforcement: spawn → yield discipline ---
+// Tool names that are considered "spawn" operations (creating sub-agents).
+// These are allowed between spawn and yield.
+const SPAWN_TOOL_PATTERNS = [
+  /^sessions_spawn$/i,
+  /^sessions_create$/i,
+  /^subagent_spawn$/i,
+  /^create_subagent$/i,
+  /^spawn/i,
+];
+
+/**
+ * Check if a tool name is a spawn-related tool (allowed between spawn and yield).
+ */
+function isSpawnTool(toolName) {
+  const name = trimToString(toolName);
+  if (!name) return false;
+  return SPAWN_TOOL_PATTERNS.some((pat) => pat.test(name));
+}
+
+/**
+ * Check if a tool name is sessions_yield.
+ */
+function isYieldTool(toolName) {
+  return trimToString(toolName) === "sessions_yield";
+}
+
+/**
+ * Mark that a subagent was spawned by the orchestrator, requiring yield before
+ * any non-spawn tool call. Supports multiple spawns in the same batch.
+ */
+function markSubagentSpawned(requesterSessionKey) {
+  const key = trimToString(requesterSessionKey);
+  if (!key) return null;
+  return updateCachedSession(key, (current) => ({
+    ...current,
+    hasUnyieldedSpawns: true,
+    unyieldedSpawnCount: (Number(current?.unyieldedSpawnCount) || 0) + 1,
+    lastSpawnAt: Date.now(),
+  }));
+}
+
+/**
+ * Clear the unyielded-spawn state after sessions_yield is called.
+ */
+function clearUnyieldedSpawns(ctx) {
+  if (sessionRole(ctx) !== "orchestrator") {
+    return null;
+  }
+  const key = sessionCacheKey(ctx);
+  return updateCachedSession(key, (current) => ({
+    ...current,
+    hasUnyieldedSpawns: false,
+    unyieldedSpawnCount: 0,
+  }));
+}
+
+/**
+ * Check whether the orchestrator has pending unyielded spawns.
+ */
+function hasUnyieldedSpawns(ctx) {
+  if (sessionRole(ctx) !== "orchestrator") {
+    return false;
+  }
+  const key = sessionCacheKey(ctx);
+  const cached = getCachedSessionState(key);
+  return !!(cached?.hasUnyieldedSpawns && cached.unyieldedSpawnCount > 0);
+}
+
+/**
+ * Enforce spawn→yield discipline in before_tool_call.
+ * Returns { block, blockReason } if the tool should be blocked, or null if allowed.
+ */
+function enforceSpawnYieldDiscipline(ctx, toolName) {
+  if (sessionRole(ctx) !== "orchestrator") {
+    return null;
+  }
+  if (!hasUnyieldedSpawns(ctx)) {
+    return null;
+  }
+  const name = trimToString(toolName);
+  // Allow spawn tools (batch spawning multiple sub-agents)
+  if (isSpawnTool(name)) {
+    return null;
+  }
+  // Allow sessions_yield (the required next step)
+  if (isYieldTool(name)) {
+    return null;
+  }
+  // Block everything else
+  const key = sessionCacheKey(ctx);
+  const cached = getCachedSessionState(key);
+  const count = cached?.unyieldedSpawnCount || 0;
+  const plural = count === 1 ? "sub-agent has" : "sub-agents have";
+  const reason =
+    `[deep-research-guard] Auto-yield enforcement: ${count} ${plural} been spawned ` +
+    `but sessions_yield has not been called yet. You MUST call sessions_yield immediately ` +
+    `before using any other tool. Tool "${name}" is blocked until yield is performed.`;
+  return { block: true, blockReason: reason };
+}
+
 function maybeResumeUnfinishedResearch(api, ctx, rdir, meta, stageInfo, message) {
   if (!rdir || !stageInfo || stageInfo.stage === "finalize") {
     return null;
@@ -2120,6 +2221,19 @@ function register(api) {
 
     const { toolName, params } = event;
 
+    // --- Auto-yield enforcement: block non-spawn/non-yield tools when spawns are pending ---
+    const spawnYieldBlock = enforceSpawnYieldDiscipline(ctx, toolName);
+    if (spawnYieldBlock) {
+      auditLog(rdir, {
+        hook: "before_tool_call",
+        role: sessionRole(ctx),
+        action: "BLOCK_SPAWN_YIELD",
+        tool: toolName,
+        reason: spawnYieldBlock.blockReason,
+      });
+      return spawnYieldBlock;
+    }
+
     if (sessionRole(ctx) === "worker") {
       const workerWrite = validateWorkerArchiveWrite(toolName, params, rdir, meta);
       if (!workerWrite.ok) {
@@ -2182,6 +2296,12 @@ function register(api) {
 
     const rdir = activeResearchDir(ctx);
     if (!rdir) return;
+
+    // Auto-yield enforcement: clear unyielded state when sessions_yield is called
+    if (isYieldTool(event.toolName)) {
+      clearUnyieldedSpawns(ctx);
+    }
+
     markToolActivity(ctx, event);
     const { toolName, toolCallId, durationMs } = event;
     auditLog(rdir, { hook: "after_tool_call", role: sessionRole(ctx), tool: toolName, toolCallId, durationMs });
@@ -2218,6 +2338,40 @@ function register(api) {
         round: meta.current_round,
       });
       return; // archive is complete — allow normal finalization
+    }
+
+    // --- Auto-yield enforcement at finalize: if spawns are pending, force yield first ---
+    if (hasUnyieldedSpawns(ctx)) {
+      const key = sessionCacheKey(ctx);
+      const cached = getCachedSessionState(key);
+      const count = cached?.unyieldedSpawnCount || 0;
+      const yieldReason =
+        `[deep-research-guard] Auto-yield enforcement: You have ${count} spawned sub-agent(s) ` +
+        `awaiting completion, but sessions_yield was never called. ` +
+        `You MUST call sessions_yield immediately to wait for sub-agent completion events. ` +
+        `Do not finalize or stop — call: { "action": "sessions_yield", "message": "等待子代理完成" }`;
+      const yieldIdempotencyKey = `deep-research-auto-yield:${meta.current_round ?? 0}:${count}`;
+      updateCachedSession(key, (current) => ({
+        ...current,
+        lastContinuationKey: yieldIdempotencyKey,
+        lastContinuationAt: Date.now(),
+      }));
+      auditLog(rdir, {
+        hook: "before_agent_finalize",
+        action: "REVISE_YIELD",
+        stage: stageInfo.stage,
+        round: meta.current_round,
+        unyieldedSpawnCount: count,
+      });
+      return {
+        action: "revise",
+        reason: yieldReason,
+        retry: {
+          instruction: yieldReason,
+          idempotencyKey: yieldIdempotencyKey,
+          maxAttempts: 5,
+        },
+      };
     }
 
     const reason = buildContinuationEvent(stageInfo, meta);
@@ -2329,6 +2483,8 @@ function register(api) {
     const requesterSessionKey = trimToString(ctx?.requesterSessionKey) || trimToString(event?.requesterSessionKey);
     const childSessionKey = trimToString(ctx?.childSessionKey) || trimToString(event?.childSessionKey);
     linkWorkerSession(requesterSessionKey, childSessionKey);
+    // Auto-yield enforcement: mark orchestrator as having unyielded spawns
+    markSubagentSpawned(requesterSessionKey);
   });
 
   api.on("subagent_ended", (event, ctx) => {
@@ -2621,6 +2777,12 @@ module.exports = {
     unlinkWorkerSession,
     markToolActivity,
     clearPendingToolContinuation,
+    isSpawnTool,
+    isYieldTool,
+    markSubagentSpawned,
+    clearUnyieldedSpawns,
+    hasUnyieldedSpawns,
+    enforceSpawnYieldDiscipline,
     getRetryConfig,
     looksLikeRateLimit,
     computeRetryDelay,

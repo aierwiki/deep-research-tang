@@ -1164,3 +1164,152 @@ test("worker archive writes are limited to registered task reports", () => {
   assert.equal(blocked.ok, false);
   assert.match(blocked.reason, /only write registered task reports/i);
 });
+
+// --- Auto-yield enforcement tests ---
+
+test("isSpawnTool recognizes spawn-related tool names", () => {
+  assert.equal(plugin.__testing.isSpawnTool("sessions_spawn"), true);
+  assert.equal(plugin.__testing.isSpawnTool("sessions_create"), true);
+  assert.equal(plugin.__testing.isSpawnTool("subagent_spawn"), true);
+  assert.equal(plugin.__testing.isSpawnTool("create_subagent"), true);
+  assert.equal(plugin.__testing.isSpawnTool("spawn_worker"), true);
+  assert.equal(plugin.__testing.isSpawnTool("read"), false);
+  assert.equal(plugin.__testing.isSpawnTool("write"), false);
+  assert.equal(plugin.__testing.isSpawnTool("sessions_yield"), false);
+  assert.equal(plugin.__testing.isSpawnTool(""), false);
+});
+
+test("isYieldTool recognizes sessions_yield", () => {
+  assert.equal(plugin.__testing.isYieldTool("sessions_yield"), true);
+  assert.equal(plugin.__testing.isYieldTool("yield"), false);
+  assert.equal(plugin.__testing.isYieldTool("sessions_spawn"), false);
+});
+
+test("markSubagentSpawned tracks unyielded spawn count", () => {
+  plugin.__testing.resetGuardActivation();
+  const rdir = makeTempResearchDir();
+  writeJson(path.join(rdir, "00_meta.json"), {
+    topic: "demo", original_question: "q?",
+    target_depth: 2, depth_mode: "user-specified",
+    current_round: 1, status: "in_progress",
+  });
+  const ctx = { sessionKey: "agent:main:main", agentId: "main" };
+  plugin.__testing.bindActiveResearch(ctx, rdir);
+
+  // Initially no unyielded spawns
+  assert.equal(plugin.__testing.hasUnyieldedSpawns(ctx), false);
+
+  // After one spawn
+  plugin.__testing.markSubagentSpawned("agent:main:main");
+  assert.equal(plugin.__testing.hasUnyieldedSpawns(ctx), true);
+
+  // After second spawn (batch)
+  plugin.__testing.markSubagentSpawned("agent:main:main");
+  assert.equal(plugin.__testing.hasUnyieldedSpawns(ctx), true);
+});
+
+test("clearUnyieldedSpawns resets spawn state after yield", () => {
+  plugin.__testing.resetGuardActivation();
+  const rdir = makeTempResearchDir();
+  writeJson(path.join(rdir, "00_meta.json"), {
+    topic: "demo", original_question: "q?",
+    target_depth: 2, depth_mode: "user-specified",
+    current_round: 1, status: "in_progress",
+  });
+  const ctx = { sessionKey: "agent:main:main", agentId: "main" };
+  plugin.__testing.bindActiveResearch(ctx, rdir);
+
+  plugin.__testing.markSubagentSpawned("agent:main:main");
+  plugin.__testing.markSubagentSpawned("agent:main:main");
+  assert.equal(plugin.__testing.hasUnyieldedSpawns(ctx), true);
+
+  plugin.__testing.clearUnyieldedSpawns(ctx);
+  assert.equal(plugin.__testing.hasUnyieldedSpawns(ctx), false);
+});
+
+test("enforceSpawnYieldDiscipline blocks non-spawn non-yield tools", () => {
+  plugin.__testing.resetGuardActivation();
+  const rdir = makeTempResearchDir();
+  writeJson(path.join(rdir, "00_meta.json"), {
+    topic: "demo", original_question: "q?",
+    target_depth: 2, depth_mode: "user-specified",
+    current_round: 1, status: "in_progress",
+  });
+  const ctx = { sessionKey: "agent:main:main", agentId: "main" };
+  plugin.__testing.bindActiveResearch(ctx, rdir);
+  plugin.__testing.markSubagentSpawned("agent:main:main");
+
+  // Should block read tool
+  const blocked = plugin.__testing.enforceSpawnYieldDiscipline(ctx, "read");
+  assert.equal(blocked?.block, true);
+  assert.match(blocked.blockReason, /sessions_yield/);
+  assert.match(blocked.blockReason, /1 sub-agent has/);
+
+  // Should allow another spawn
+  const allowSpawn = plugin.__testing.enforceSpawnYieldDiscipline(ctx, "sessions_spawn");
+  assert.equal(allowSpawn, null);
+
+  // Should allow sessions_yield
+  const allowYield = plugin.__testing.enforceSpawnYieldDiscipline(ctx, "sessions_yield");
+  assert.equal(allowYield, null);
+});
+
+test("enforceSpawnYieldDiscipline allows everything when no spawns pending", () => {
+  plugin.__testing.resetGuardActivation();
+  const rdir = makeTempResearchDir();
+  writeJson(path.join(rdir, "00_meta.json"), {
+    topic: "demo", original_question: "q?",
+    target_depth: 2, depth_mode: "user-specified",
+    current_round: 1, status: "in_progress",
+  });
+  const ctx = { sessionKey: "agent:main:main", agentId: "main" };
+  plugin.__testing.bindActiveResearch(ctx, rdir);
+
+  // No spawns → no blocking
+  assert.equal(plugin.__testing.enforceSpawnYieldDiscipline(ctx, "read"), null);
+  assert.equal(plugin.__testing.enforceSpawnYieldDiscipline(ctx, "write"), null);
+  assert.equal(plugin.__testing.enforceSpawnYieldDiscipline(ctx, "exec"), null);
+});
+
+test("enforceSpawnYieldDiscipline does not affect worker sessions", () => {
+  plugin.__testing.resetGuardActivation();
+  const rdir = makeTempResearchDir();
+  writeJson(path.join(rdir, "00_meta.json"), {
+    topic: "demo", original_question: "q?",
+    target_depth: 2, depth_mode: "user-specified",
+    current_round: 1, status: "in_progress",
+  });
+  const workerCtx = { sessionKey: "agent:main:subagent:worker-1", agentId: "main" };
+  plugin.__testing.bindActiveResearch(workerCtx, rdir);
+
+  // Workers are never blocked by spawn-yield discipline
+  assert.equal(plugin.__testing.enforceSpawnYieldDiscipline(workerCtx, "read"), null);
+});
+
+test("full spawn-yield cycle: spawn multiple → block → yield → unblock", () => {
+  plugin.__testing.resetGuardActivation();
+  const rdir = makeTempResearchDir();
+  writeJson(path.join(rdir, "00_meta.json"), {
+    topic: "demo", original_question: "q?",
+    target_depth: 2, depth_mode: "user-specified",
+    current_round: 1, status: "in_progress",
+  });
+  const ctx = { sessionKey: "agent:main:main", agentId: "main" };
+  plugin.__testing.bindActiveResearch(ctx, rdir);
+
+  // Spawn two sub-agents (batch)
+  plugin.__testing.markSubagentSpawned("agent:main:main");
+  plugin.__testing.markSubagentSpawned("agent:main:main");
+
+  // Regular tools are blocked
+  const blocked = plugin.__testing.enforceSpawnYieldDiscipline(ctx, "write");
+  assert.equal(blocked?.block, true);
+  assert.match(blocked.blockReason, /2 sub-agents have/);
+
+  // Yield clears the state
+  plugin.__testing.clearUnyieldedSpawns(ctx);
+
+  // Now regular tools are allowed again
+  assert.equal(plugin.__testing.enforceSpawnYieldDiscipline(ctx, "write"), null);
+  assert.equal(plugin.__testing.hasUnyieldedSpawns(ctx), false);
+});
