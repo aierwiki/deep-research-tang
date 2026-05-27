@@ -425,3 +425,29 @@ python scripts/init_deep_research_archive.py --topic api-gateway --question "是
 - subagent 不需要知道完整的研究上下文，只需要知道自己的任务
 - subagent 是 task worker，不是整场 deep-research 的 orchestrator；它的合法收尾条件是“完成自己负责的任务并交回结果”，不是把整个研究推进到 finalize
 - 即便并行执行，也要先完成任务登记，再把任务分发给 subagent；禁止边想边补登记表
+
+### 子代理等待机制（铁律）
+
+OpenClaw 的子代理是 **push-based** 架构：spawn 后子代理在后台运行，完成后 completion event 会作为**下一条消息**推送给主 agent。主 agent 必须正确等待：
+
+1. **spawn 所有子代理后，必须立即调用 `sessions_yield`**
+
+```json
+{ "action": "sessions_yield", "message": "等待子代理完成" }
+```
+
+这会结束当前 turn，让 completion event 作为下一条消息到达。
+
+2. **禁止在 spawn 后做其他工具调用**：spawn → sessions_yield 必须紧密相连。
+
+3. **子代理完成事件到达后**，主 agent 被唤醒，此时必须：
+   - 按 `02_task_registry.json` 中的 task_id 逐一验证 task report 文件
+   - 有缺失的文件则标记为失败，可在下一批重试
+   - 全部确认后才能进入 round summary 和 delta report 阶段
+
+4. **多批次执行**：如果一轮 task 数量较多（>2 个），分批次 spawn（每批 2 个），每批都遵循 spawn → sessions_yield → 验证文件的流程。
+
+5. **绝对禁止**：
+   - ❌ spawn 后不调用 sessions_yield 就结束 turn
+   - ❌ 用 exec sleep 或 process poll 轮询子代理状态
+   - ❌ 用 sessions_list 轮询子代理状态
