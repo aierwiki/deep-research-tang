@@ -1673,8 +1673,9 @@ function enforceSpawnYieldDiscipline(ctx, toolName) {
   const key = sessionCacheKey(ctx);
   const cached = getCachedSessionState(key);
   const count = cached?.unyieldedSpawnCount || 0;
+  const plural = count === 1 ? "sub-agent has" : "sub-agents have";
   const reason =
-    `[deep-research-guard] Auto-yield enforcement: ${count} sub-agent(s) have been spawned ` +
+    `[deep-research-guard] Auto-yield enforcement: ${count} ${plural} been spawned ` +
     `but sessions_yield has not been called yet. You MUST call sessions_yield immediately ` +
     `before using any other tool. Tool "${name}" is blocked until yield is performed.`;
   return { block: true, blockReason: reason };

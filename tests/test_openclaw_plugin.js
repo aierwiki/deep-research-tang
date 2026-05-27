@@ -1243,7 +1243,7 @@ test("enforceSpawnYieldDiscipline blocks non-spawn non-yield tools", () => {
   const blocked = plugin.__testing.enforceSpawnYieldDiscipline(ctx, "read");
   assert.equal(blocked?.block, true);
   assert.match(blocked.blockReason, /sessions_yield/);
-  assert.match(blocked.blockReason, /1 sub-agent/);
+  assert.match(blocked.blockReason, /1 sub-agent has/);
 
   // Should allow another spawn
   const allowSpawn = plugin.__testing.enforceSpawnYieldDiscipline(ctx, "sessions_spawn");
@@ -1304,7 +1304,7 @@ test("full spawn-yield cycle: spawn multiple → block → yield → unblock", (
   // Regular tools are blocked
   const blocked = plugin.__testing.enforceSpawnYieldDiscipline(ctx, "write");
   assert.equal(blocked?.block, true);
-  assert.match(blocked.blockReason, /2 sub-agent/);
+  assert.match(blocked.blockReason, /2 sub-agents have/);
 
   // Yield clears the state
   plugin.__testing.clearUnyieldedSpawns(ctx);
