@@ -40,7 +40,60 @@ mkdir -p .github/skills/deep-research
 cp SKILL.md .github/skills/deep-research/
 ```
 
-### OpenClaw / 其他框架
+### OpenClaw
+
+```bash
+# 需要先安装 OpenClaw，并确保 openclaw、node、python3 在 PATH 中
+openclaw --version
+node --version
+python3 --version
+
+# 从本仓库根目录安装
+bash scripts/install_openclaw_deep_research.sh
+```
+
+这个脚本会把 skill 和 runtime plugin 一起安装到 OpenClaw：
+
+- 将 [openclaw-plugin](openclaw-plugin) 加入 `plugins.load.paths`
+- 将 `deep-research-guard` 加入 `plugins.allow`
+- 启用 `plugins.entries.deep-research-guard.enabled`
+- 写入必要 hook 权限：
+  - `plugins.entries.deep-research-guard.hooks.allowConversationAccess=true`
+  - `plugins.entries.deep-research-guard.hooks.allowPromptInjection=true`
+- 写入插件配置 `scriptsDir`、`strict`
+- 复制 `SKILL.md`、`scripts/`、`templates/` 到 OpenClaw workspace skills 目录
+- 刷新 OpenClaw plugin registry
+- 尝试重启 OpenClaw gateway
+- 写配置前备份 `~/.openclaw/openclaw.json`
+
+安装后验证：
+
+```bash
+openclaw plugins inspect deep-research-guard --runtime --json
+openclaw plugins doctor
+```
+
+`inspect` 输出中应能看到：
+
+```json
+"toolNames": ["deep_research_session"],
+"hookCount": 9
+```
+
+并且 `typedHooks` 中应包含 `before_agent_finalize`、`before_prompt_build`、`before_tool_call`、`after_tool_call`、`agent_end`。
+
+如果你的系统不能由脚本自动重启 gateway（例如非 macOS/非 launchctl 环境），安装后手动重启 OpenClaw gateway，再运行上面的验证命令。
+
+可选参数：
+
+```bash
+bash scripts/install_openclaw_deep_research.sh --dry-run
+bash scripts/install_openclaw_deep_research.sh --config-path /path/to/openclaw.json
+bash scripts/install_openclaw_deep_research.sh --strict false
+bash scripts/install_openclaw_deep_research.sh --no-restart
+```
+
+### 其他框架
 
 ```bash
 # 通用路径
@@ -230,7 +283,13 @@ worker 不再被要求“必须把整个研究做到 finalize 才能停”，否
 
 ### OpenClaw 安装提示
 
-将 [openclaw-plugin](openclaw-plugin) 目录加入 OpenClaw 的 `plugins.load.paths`，并在 `plugins.allow` 中允许 `deep-research-guard`。
+推荐使用一键安装脚本：
+
+```bash
+bash scripts/install_openclaw_deep_research.sh
+```
+
+不要只手工复制 `SKILL.md`。OpenClaw 下必须同时安装 runtime plugin，否则 `before_agent_finalize` 等止停门禁不会生效。
 
 当前版本不再在安装阶段绑定某一个固定 `researchDir`。正确模型是：
 
@@ -240,21 +299,27 @@ worker 不再被要求“必须把整个研究做到 finalize 才能停”，否
 
 详细示例见 [openclaw-plugin/README.md](openclaw-plugin/README.md)。
 
-如果你想直接一键写入 OpenClaw 配置，可以运行：
-
-```bash
-bash scripts/install_openclaw_deep_research.sh
-```
-
 这个脚本会自动：
 
 - 把 [openclaw-plugin](openclaw-plugin) 加入 `plugins.load.paths`
 - 把 `deep-research-guard` 加入 `plugins.allow`
 - 启用 `plugins.entries.deep-research-guard.enabled`
+- 写入 `plugins.entries.deep-research-guard.hooks.allowConversationAccess=true`
+- 写入 `plugins.entries.deep-research-guard.hooks.allowPromptInjection=true`
 - 写入 `scriptsDir`、`strict`
 - 把完整 skill bundle 安装到 OpenClaw workspace skills 目录
 - 复制 `SKILL.md`、`scripts/`、`templates/`，让 skill 在 OpenClaw 里可独立运行
+- 刷新 OpenClaw plugin registry
 - 在改写前为 OpenClaw 配置文件创建时间戳备份
+
+安装后建议验证：
+
+```bash
+openclaw plugins inspect deep-research-guard --runtime --json
+openclaw plugins doctor
+```
+
+其中 `inspect` 应显示 `toolNames` 包含 `deep_research_session`，`hookCount` 为非 0，并且 `typedHooks` 中包含 `before_agent_finalize`。
 
 ## License
 

@@ -3,6 +3,17 @@
   "name": "Deep Research Guard",
   "description": "Enforces deep-research archive discipline with prompt guidance, tool gating, stop interception, and audit logging.",
   "version": "1.7.0",
+  "contracts": {
+    "tools": [
+      "deep_research_session"
+    ]
+  },
+  "activation": {
+    "onStartup": true,
+    "onCapabilities": [
+      "hook"
+    ]
+  },
   "configSchema": {
     "type": "object",
     "properties": {

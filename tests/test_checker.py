@@ -324,6 +324,16 @@ class TestTaskRegistryRules:
         codes = [e["code"] for e in report["errors"]]
         assert "ERR_TASK_REPORT_THIN" in codes
 
+    def test_markdown_emphasized_task_id_is_accepted(self, tmp_path):
+        write_meta(tmp_path, target_depth=1, current_round=1)
+        (tmp_path / "00_research_brief.md").write_text("# Brief\n", encoding="utf-8")
+        build_minimal_round(tmp_path, 1)
+        report_path = tmp_path / "round_01" / "tasks" / "task_01_x.md"
+        text = report_path.read_text(encoding="utf-8").replace("R01-T01", "**R01-T01**", 1)
+        report_path.write_text(text, encoding="utf-8")
+        report = check_archive(tmp_path, strict=False, only_round=None)
+        assert report["result"] == "PASS", report["errors"]
+
 
 class TestDepthEnforcement:
     def test_depth_mismatch_strict_fails(self, tmp_path):
@@ -367,6 +377,19 @@ class TestFinalReportPremature:
         assert report["result"] == "FAIL"
         codes = [e["code"] for e in report["errors"]]
         assert "ERR_FINAL_REPORT_PREMATURE" in codes
+
+    def test_placeholder_final_report_before_depth_is_not_premature(self, tmp_path):
+        write_meta(tmp_path, target_depth=4, current_round=2)
+        (tmp_path / "00_research_brief.md").write_text("# Brief\n", encoding="utf-8")
+        for n in range(1, 3):
+            build_minimal_round(tmp_path, n)
+        (tmp_path / "final_report.md").write_text(
+            (TEMPLATES_DIR / "final_report.md").read_text(encoding="utf-8"),
+            encoding="utf-8",
+        )
+        report = check_archive(tmp_path, strict=True, only_round=None)
+        codes = [e["code"] for e in report["errors"]]
+        assert "ERR_FINAL_REPORT_PREMATURE" not in codes
 
     def test_completed_without_real_final_report_fails_strict(self, tmp_path):
         write_meta(tmp_path, target_depth=2, current_round=2)

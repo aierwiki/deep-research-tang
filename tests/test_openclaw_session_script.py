@@ -240,6 +240,17 @@ def test_advance_round_validates_and_scaffolds_next_round(tmp_path: Path) -> Non
         "--no-check",
     )
     research_dir = Path(started["research_dir"])
+    marker_path = workspace_dir / ".deep-research" / "active.json"
+    marker = json.loads(marker_path.read_text(encoding="utf-8"))
+    marker.update(
+        {
+            "version": 2,
+            "owner_session_id": "session-owner",
+            "owner_session_key": "agent:main:dashboard:owner",
+            "worker_session_keys": ["agent:main:subagent:worker-1"],
+        }
+    )
+    write_json(marker_path, marker)
     build_valid_round(research_dir, 1)
 
     advanced = run_cmd(
@@ -254,6 +265,11 @@ def test_advance_round_validates_and_scaffolds_next_round(tmp_path: Path) -> Non
     meta = json.loads((research_dir / "00_meta.json").read_text(encoding="utf-8"))
     assert meta["current_round"] == 2
     assert meta["status"] == "in_progress"
+    marker_after = json.loads(marker_path.read_text(encoding="utf-8"))
+    assert marker_after["version"] == 2
+    assert marker_after["owner_session_id"] == "session-owner"
+    assert marker_after["owner_session_key"] == "agent:main:dashboard:owner"
+    assert marker_after["worker_session_keys"] == ["agent:main:subagent:worker-1"]
     assert (research_dir / "round_02" / "01_seed_clues.json").exists()
     assert (research_dir / "round_02" / "02_task_registry.json").exists()
 

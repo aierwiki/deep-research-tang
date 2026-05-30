@@ -237,6 +237,64 @@ test("detectArchiveStage reports execution when task reports are structurally in
   assert.match(stage.blockedReason, /missing section/i);
 });
 
+test("detectArchiveStage accepts markdown-emphasized task ids in reports", () => {
+  const rdir = makeTempResearchDir();
+  writeText(path.join(rdir, "00_research_brief.md"), "# Brief\n");
+  writeJson(path.join(rdir, "00_meta.json"), {
+    topic: "demo",
+    original_question: "q?",
+    target_depth: 2,
+    depth_mode: "user-specified",
+    current_round: 1,
+    status: "in_progress",
+  });
+  writeJson(path.join(rdir, "round_01", "01_seed_clues.json"), {
+    round: 1,
+    seed_clues: [
+      {
+        clue_id: "R01-C01",
+        source_round: 0,
+        source_ref: "original-question",
+        question: "What matters?",
+        why_it_matters: "Important",
+      },
+    ],
+  });
+  writeJson(path.join(rdir, "round_01", "02_task_registry.json"), {
+    round: 1,
+    tasks: [
+      {
+        task_id: "R01-T01",
+        title: "Architecture",
+        task_type: "exploratory",
+        research_dimension: "architecture",
+        key_question: "What is the current architecture?",
+        planned_actions: ["read docs", "read code", "compare"],
+        expected_evidence: ["docs", "code"],
+        depends_on: [],
+        report_path: "round_01/tasks/task_01_architecture.md",
+      },
+    ],
+  });
+  writeTaskReport(path.join(rdir, "round_01", "tasks", "task_01_architecture.md"), "**R01-T01**");
+  writeText(path.join(rdir, "round_01", "03_round_summary.md"), "# Summary\n");
+  writeJson(path.join(rdir, "round_01", "04_delta_report.json"), {
+    round: 1,
+    new_findings: [
+      { finding_id: "R01-F01", summary: "Finding one" },
+      { finding_id: "R01-F02", summary: "Finding two" },
+      { finding_id: "R01-F03", summary: "Finding three" },
+    ],
+    contradictions: [],
+    carry_forward_clues: [{ clue_id: "R01-CF01", question: "Next q" }],
+    coverage_assessment: "partial",
+  });
+
+  const meta = JSON.parse(fs.readFileSync(path.join(rdir, "00_meta.json"), "utf8"));
+  const stage = plugin.__testing.detectArchiveStage(null, rdir, meta);
+  assert.equal(stage.stage, "advance");
+});
+
 test("detectArchiveStage reports planning when task registry schema is invalid", () => {
   const rdir = makeTempResearchDir();
   writeJson(path.join(rdir, "00_meta.json"), {
@@ -703,6 +761,49 @@ test("rebindOwnedActiveSession stamps owner session metadata onto the marker", (
   assert.equal(payload.owner_session_id, "session-owner");
   assert.equal(payload.owner_session_key, "agent:main:main");
   assert.deepEqual(payload.worker_session_keys, []);
+});
+
+test("session lifecycle tool signals rebind owner after advance-round", async () => {
+  plugin.__testing.resetGuardActivation();
+  const workspaceDir = fs.mkdtempSync(path.join(os.tmpdir(), "deep-research-workspace-"));
+  const researchDir = path.join(workspaceDir, "research_20260417_demo");
+  fs.mkdirSync(path.join(workspaceDir, ".deep-research"), { recursive: true });
+  fs.mkdirSync(researchDir, { recursive: true });
+  writeJson(path.join(workspaceDir, ".deep-research", "active.json"), {
+    version: 2,
+    action: "advance-round",
+    workspace_dir: workspaceDir,
+    research_dir: researchDir,
+  });
+
+  const handlers = {};
+  plugin.register({
+    registerTool: () => {},
+    on: (name, handler) => {
+      handlers[name] = handler;
+    },
+  });
+
+  await handlers.after_tool_call(
+    {
+      result: {
+        signal:
+          `DEEP_RESEARCH_SESSION {"action":"advance-round","workspace_dir":${JSON.stringify(workspaceDir)},"research_dir":${JSON.stringify(researchDir)}}`,
+      },
+      toolName: "deep_research_session",
+    },
+    {
+      workspaceDir,
+      sessionId: "session-owner",
+      sessionKey: "agent:main:dashboard:owner",
+    },
+  );
+
+  const payload = JSON.parse(
+    fs.readFileSync(path.join(workspaceDir, ".deep-research", "active.json"), "utf8"),
+  );
+  assert.equal(payload.owner_session_id, "session-owner");
+  assert.equal(payload.owner_session_key, "agent:main:dashboard:owner");
 });
 
 test("legacy workspace-only markers stay dormant until re-activated", () => {

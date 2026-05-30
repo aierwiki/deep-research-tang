@@ -389,7 +389,14 @@ function meaningfulSectionLines(text) {
     .split("\n")
     .map((line) => line.trim())
     .filter(Boolean)
-    .map((line) => line.replace(/^[-*]\s+/, "").replace(/^\d+\.\s+/, "").trim())
+    .map((line) =>
+      line
+        .replace(/^[-*]\s+/, "")
+        .replace(/^\d+\.\s+/, "")
+        .replace(/^(\*\*|__)(.+)\1$/, "$2")
+        .replace(/^(\*|_|`)(.+)\1$/, "$2")
+        .trim(),
+    )
     .filter((line) => line && line !== "-" && line !== "*" && !line.toLowerCase().includes("replace-with"));
 }
 
@@ -2287,7 +2294,12 @@ function register(api) {
     const signal = parseSessionSignal(event.result);
     if (signal?.action === "clear") {
       bindActiveResearch(ctx, null);
-    } else if (signal?.action === "start" || signal?.action === "activate") {
+    } else if (
+      signal?.action === "start" ||
+      signal?.action === "activate" ||
+      signal?.action === "advance-round" ||
+      signal?.action === "finalize"
+    ) {
       const rebound = rebindOwnedActiveSession(ctx, signal);
       if (rebound) {
         bindActiveResearch(ctx, rebound.researchDir, rebound.marker);

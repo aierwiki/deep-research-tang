@@ -111,6 +111,16 @@ def emit_and_persist(workspace_dir: Path, payload: dict, *, persist: bool = True
     emit(payload)
 
 
+def preserve_session_owner(workspace_dir: Path, payload: dict) -> dict:
+    current = read_state(workspace_dir) or {}
+    for key in ("owner_session_id", "owner_session_key", "worker_session_keys"):
+        if key in current and key not in payload:
+            payload[key] = current[key]
+    if current.get("version") == 2 and payload.get("version") == 1:
+        payload["version"] = 2
+    return payload
+
+
 def round_pass_payload(action: str, workspace_dir: Path, research_dir: Path, **extra: object) -> dict:
     payload = {
         "version": 1,
@@ -120,7 +130,7 @@ def round_pass_payload(action: str, workspace_dir: Path, research_dir: Path, **e
         "activated_at": utc_now(),
     }
     payload.update(extra)
-    return payload
+    return preserve_session_owner(workspace_dir, payload)
 
 
 def cmd_start(args: argparse.Namespace) -> int:

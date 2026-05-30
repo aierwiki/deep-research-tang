@@ -105,7 +105,7 @@ REQUIRED_TASK_REPORT_SECTIONS = [
 
 
 def is_placeholder_final_report(content: str) -> bool:
-    return "replace-with" in content or content.strip() == FINAL_REPORT_PLACEHOLDER
+    return "replace-with" in content or content.strip() == FINAL_REPORT_PLACEHOLDER.strip()
 
 
 def parse_markdown_sections(text: str) -> dict[str, str]:
@@ -130,6 +130,8 @@ def meaningful_section_lines(text: str) -> list[str]:
             continue
         line = re.sub(r"^[-*]\s+", "", line)
         line = re.sub(r"^\d+\.\s+", "", line)
+        line = re.sub(r"^(\*\*|__)(.+)\1$", r"\2", line)
+        line = re.sub(r"^(\*|_|`)(.+)\1$", r"\2", line)
         line = line.strip()
         if not line or line == "-" or line == "*" or "replace-with" in line.lower():
             continue

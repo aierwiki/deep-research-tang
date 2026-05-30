@@ -13,6 +13,7 @@ Options:
   --strict BOOL         Plugin strict mode: true/false. Default: true.
   --dry-run             Validate the merged config without writing it.
   --no-backup           Do not create a timestamped backup before writing.
+  --no-registry-refresh Do not refresh OpenClaw's persisted plugin registry.
   --no-restart          Do not restart the OpenClaw gateway service after install.
   -h, --help            Show this help.
 
@@ -94,6 +95,7 @@ STRICT_JSON='true'
 DRY_RUN='false'
 CREATE_BACKUP='true'
 RESTART_GATEWAY='true'
+REFRESH_REGISTRY='true'
 WORKSPACE_DIR=""
 
 while [[ $# -gt 0 ]]; do
@@ -114,6 +116,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --no-backup)
       CREATE_BACKUP='false'
+      shift
+      ;;
+    --no-registry-refresh)
+      REFRESH_REGISTRY='false'
       shift
       ;;
     --no-restart)
@@ -159,6 +165,7 @@ export LOAD_JSON ALLOW_JSON PLUGIN_CFG_JSON PLUGIN_DIR SCRIPTS_DIR STRICT_JSON P
 
 node <<'NODE'
 const fs = require("fs");
+const path = require("path");
 
 function parseJson(name, fallback) {
   const raw = process.env[name];
@@ -171,6 +178,49 @@ function parseJson(name, fallback) {
 
 function uniqStrings(values) {
   return [...new Set(values.filter((value) => typeof value === "string" && value.length > 0))];
+}
+
+function resolveComparablePath(value) {
+  try {
+    return fs.realpathSync(value);
+  } catch (_) {
+    return path.resolve(value);
+  }
+}
+
+function readJsonFile(filePath) {
+  try {
+    return JSON.parse(fs.readFileSync(filePath, "utf8"));
+  } catch (_) {
+    return undefined;
+  }
+}
+
+function pluginIdForLoadPath(loadPath) {
+  const manifest = readJsonFile(path.join(loadPath, "openclaw.plugin.json"));
+  const manifestId =
+    typeof manifest?.id === "string"
+      ? manifest.id.trim()
+      : typeof manifest?.name === "string"
+        ? manifest.name.trim()
+        : "";
+  if (manifestId) {
+    return manifestId;
+  }
+
+  const pkg = readJsonFile(path.join(loadPath, "package.json"));
+  return typeof pkg?.name === "string" ? pkg.name.trim() : "";
+}
+
+function isSamePath(left, right) {
+  return resolveComparablePath(left) === resolveComparablePath(right);
+}
+
+function keepLoadPath(loadPath) {
+  if (isSamePath(loadPath, process.env.PLUGIN_DIR)) {
+    return true;
+  }
+  return pluginIdForLoadPath(loadPath) !== process.env.PLUGIN_ID;
 }
 
 const loadPaths = parseJson("LOAD_JSON", []);
@@ -197,7 +247,7 @@ delete nextPluginConfig.researchDir;
 const batch = [
   {
     path: "plugins.load.paths",
-    value: uniqStrings([...loadPaths, process.env.PLUGIN_DIR]),
+    value: uniqStrings([...loadPaths.filter(keepLoadPath), process.env.PLUGIN_DIR]),
   },
   {
     path: "plugins.allow",
@@ -205,6 +255,14 @@ const batch = [
   },
   {
     path: `plugins.entries.${process.env.PLUGIN_ID}.enabled`,
+    value: true,
+  },
+  {
+    path: `plugins.entries.${process.env.PLUGIN_ID}.hooks.allowConversationAccess`,
+    value: true,
+  },
+  {
+    path: `plugins.entries.${process.env.PLUGIN_ID}.hooks.allowPromptInjection`,
     value: true,
   },
   {
@@ -242,6 +300,15 @@ else
   cp -R "$REPO_ROOT/templates" "$SKILL_TEMPLATES_TARGET_DIR"
   echo "Installed ${PLUGIN_ID} into ${CONFIG_PATH}"
   echo "Installed skill ${SKILL_NAME} into ${SKILL_TARGET_DIR}"
+  if [[ "$REFRESH_REGISTRY" == 'true' ]]; then
+    if OPENCLAW_CONFIG_PATH="$CONFIG_PATH" openclaw plugins registry --refresh >/dev/null; then
+      echo "Refreshed OpenClaw plugin registry."
+    else
+      echo "Warning: OpenClaw plugin registry refresh failed. Run: OPENCLAW_CONFIG_PATH=\"$CONFIG_PATH\" openclaw plugins registry --refresh" >&2
+    fi
+  else
+    echo "Skipped OpenClaw plugin registry refresh (--no-registry-refresh)."
+  fi
   if [[ "$RESTART_GATEWAY" == 'true' ]]; then
     restart_openclaw_gateway
   else
