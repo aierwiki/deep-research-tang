@@ -1,14 +1,13 @@
 # Deep Research Guard Plugin
 
-OpenClaw runtime plugin for enforcing the `deep-research` archive workflow.
+OpenClaw runtime plugin for lightweight `deep-research` checkpoints and recovery.
 
 ## What It Does
 
-- Injects step-specific workflow guidance before each agent run
-- Blocks exploratory tool calls when the archive is not ready
-- Detects plain assistant stop attempts with no tool use while research is unfinished
-- Enqueues a trusted continuation message and wakes the same session to keep the research moving
-- Still allows archive-maintenance commands such as checker/repair scripts
+- Injects short active-research status before each agent run
+- Keeps normal tool use permissive in the default `lite` mode
+- Prevents obvious early finalization while research is unfinished
+- Moves hard validation to `advance-round`, `finalize`, and `recover`
 - Records audit events for tool usage and unfinished exits
 - Writes detailed wake diagnostics to JSONL logs for post-mortem debugging
 
@@ -36,6 +35,7 @@ OpenClaw runtime plugin for enforcing the `deep-research` archive workflow.
         "enabled": true,
         "config": {
           "scriptsDir": "/absolute/path/to/deep-research/scripts",
+          "guardMode": "lite",
           "strict": true
         }
       }
@@ -44,9 +44,9 @@ OpenClaw runtime plugin for enforcing the `deep-research` archive workflow.
 }
 ```
 
-The plugin no longer binds a global `researchDir` at install time. Instead, the installed skill starts or activates a research session per topic by writing `.deep-research/active.json` inside the OpenClaw workspace.
+The plugin no longer binds a global `researchDir` at install time. Instead, the installed skill starts or activates a research session per topic by writing `.deep-research/active.json` inside the OpenClaw workspace. In v3 markers, the active research is bound to `workspace + research_dir`; session ids are only `last_seen_*` audit metadata.
 
-You can still set `DEEP_RESEARCH_SCRIPTS` and `DEEP_RESEARCH_STRICT` via environment variables.
+You can still set `DEEP_RESEARCH_SCRIPTS`, `DEEP_RESEARCH_STRICT`, and `DEEP_RESEARCH_GUARD_MODE` via environment variables.
 
 ## One-Command Install
 
@@ -86,6 +86,14 @@ python scripts/openclaw_deep_research_session.py finalize --strict
 
 This validates the whole archive and marks the session completed.
 
+If a run stops, changes chat session, or seems confused about the next step:
+
+```bash
+python scripts/openclaw_deep_research_session.py recover --strict
+```
+
+This runs the checker and returns the next repair or continuation instruction without mutating the research meta.
+
 To continue an existing archive:
 
 ```bash
@@ -99,25 +107,32 @@ To clear the active binding after the research is done:
 python scripts/openclaw_deep_research_session.py clear
 ```
 
-## Stop Interception
+## Lite vs Strict
 
-When a deep-research session is active, the plugin now treats a plain assistant message with no tool use as a potential "I am done" signal.
+Default mode is `lite`. It avoids most runtime blocking because OpenClaw sessions, subagents, compaction, and completion delivery can otherwise create fragile edge cases. Lite mode:
 
-If the archive state is still before `finalize`, the plugin will:
+- reminds the agent of the active archive and checkpoint commands
+- permits normal exploratory and file tools during a round
+- blocks only obvious early finalization while `00_meta.json` is not completed
+- relies on `advance-round`, `finalize`, and `recover` for validation
 
-- block that assistant message from being persisted to the session transcript
-- enqueue a trusted system continuation instruction for the same session
-- request an immediate heartbeat wake for that session so the agent keeps working
+Legacy strict mode can still be enabled with:
 
-This keeps the design narrow: the plugin does not try to globally ban tools or rewrite the whole run loop. It only intervenes at the exact moment the agent tries to stop early.
+```json
+{
+  "plugins": {
+    "entries": {
+      "deep-research-guard": {
+        "config": {
+          "guardMode": "strict"
+        }
+      }
+    }
+  }
+}
+```
 
-There is now a second narrow recovery path as well:
-
-- if a run goes idle immediately after a normal tool result and the archive is still unfinished
-- and there was no plain assistant continuation message to intercept
-- the plugin enqueues one trusted continuation event and wakes the same session once
-
-This specifically covers the real-world failure mode where the agent stops right after tool completion and only resumes when the user sends another message.
+Strict mode re-enables stage/tool gates, worker write restrictions, spawn/yield enforcement, and automatic wake paths.
 
 The important stage split is now:
 

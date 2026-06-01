@@ -1,7 +1,7 @@
 {
   "name": "deep-research-guard",
-  "version": "1.7.0",
-  "description": "OpenClaw runtime plugin: enforces deep-research archive discipline with prompt guidance, tool gating, and stop interception",
+  "version": "1.8.0",
+  "description": "OpenClaw runtime plugin: lightweight deep-research checkpoints, recovery, and stop reminders",
   "main": "index.js",
   "openclaw": {
     "plugin": true,

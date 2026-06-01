@@ -11,6 +11,7 @@ Usage:
 Options:
   --config-path PATH    OpenClaw config file path. Defaults to $OPENCLAW_CONFIG_PATH or ~/.openclaw/openclaw.json.
   --strict BOOL         Plugin strict mode: true/false. Default: true.
+  --guard-mode MODE     Guard mode: lite/strict. Default: lite.
   --dry-run             Validate the merged config without writing it.
   --no-backup           Do not create a timestamped backup before writing.
   --no-registry-refresh Do not refresh OpenClaw's persisted plugin registry.
@@ -29,7 +30,9 @@ die() {
 }
 
 bool_json() {
-  case "${1,,}" in
+  local value
+  value="$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')"
+  case "$value" in
     1|true|yes|on) printf 'true' ;;
     0|false|no|off) printf 'false' ;;
     *) die "invalid boolean value: $1" ;;
@@ -92,6 +95,7 @@ SKILL_SOURCE="$REPO_ROOT/SKILL.md"
 SKILL_NAME="deep-research"
 CONFIG_PATH="${OPENCLAW_CONFIG_PATH:-$HOME/.openclaw/openclaw.json}"
 STRICT_JSON='true'
+GUARD_MODE='lite'
 DRY_RUN='false'
 CREATE_BACKUP='true'
 RESTART_GATEWAY='true'
@@ -108,6 +112,15 @@ while [[ $# -gt 0 ]]; do
     --strict)
       [[ $# -ge 2 ]] || die "--strict requires a value"
       STRICT_JSON="$(bool_json "$2")"
+      shift 2
+      ;;
+    --guard-mode)
+      [[ $# -ge 2 ]] || die "--guard-mode requires a value"
+      MODE_VALUE="$(printf '%s' "$2" | tr '[:upper:]' '[:lower:]')"
+      case "$MODE_VALUE" in
+        lite|strict) GUARD_MODE="$MODE_VALUE" ;;
+        *) die "invalid guard mode: $2" ;;
+      esac
       shift 2
       ;;
     --dry-run)
@@ -161,7 +174,7 @@ SKILL_SCRIPTS_TARGET_DIR="$SKILL_TARGET_DIR/scripts"
 SKILL_TEMPLATES_TARGET_DIR="$SKILL_TARGET_DIR/templates"
 
 BATCH_FILE="$(mktemp)"
-export LOAD_JSON ALLOW_JSON PLUGIN_CFG_JSON PLUGIN_DIR SCRIPTS_DIR STRICT_JSON PLUGIN_ID BATCH_FILE
+export LOAD_JSON ALLOW_JSON PLUGIN_CFG_JSON PLUGIN_DIR SCRIPTS_DIR STRICT_JSON GUARD_MODE PLUGIN_ID BATCH_FILE
 
 node <<'NODE'
 const fs = require("fs");
@@ -241,6 +254,7 @@ const nextPluginConfig = {
   ...currentPluginConfig,
   scriptsDir: process.env.SCRIPTS_DIR,
   strict: process.env.STRICT_JSON === "true",
+  guardMode: process.env.GUARD_MODE || "lite",
 };
 delete nextPluginConfig.researchDir;
 

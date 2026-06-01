@@ -195,6 +195,9 @@ def test_start_status_clear_roundtrip(tmp_path: Path) -> None:
     meta = json.loads((research_dir / "00_meta.json").read_text(encoding="utf-8"))
     assert meta["current_round"] == 1
     assert meta["status"] == "in_progress"
+    marker = json.loads((workspace_dir / ".deep-research" / "active.json").read_text(encoding="utf-8"))
+    assert marker["version"] == 3
+    assert marker["research_dir"] == str(research_dir)
 
     status = run_cmd("status", "--workspace-dir", str(workspace_dir))
     assert status["active"] is True
@@ -241,16 +244,6 @@ def test_advance_round_validates_and_scaffolds_next_round(tmp_path: Path) -> Non
     )
     research_dir = Path(started["research_dir"])
     marker_path = workspace_dir / ".deep-research" / "active.json"
-    marker = json.loads(marker_path.read_text(encoding="utf-8"))
-    marker.update(
-        {
-            "version": 2,
-            "owner_session_id": "session-owner",
-            "owner_session_key": "agent:main:dashboard:owner",
-            "worker_session_keys": ["agent:main:subagent:worker-1"],
-        }
-    )
-    write_json(marker_path, marker)
     build_valid_round(research_dir, 1)
 
     advanced = run_cmd(
@@ -266,12 +259,46 @@ def test_advance_round_validates_and_scaffolds_next_round(tmp_path: Path) -> Non
     assert meta["current_round"] == 2
     assert meta["status"] == "in_progress"
     marker_after = json.loads(marker_path.read_text(encoding="utf-8"))
-    assert marker_after["version"] == 2
-    assert marker_after["owner_session_id"] == "session-owner"
-    assert marker_after["owner_session_key"] == "agent:main:dashboard:owner"
-    assert marker_after["worker_session_keys"] == ["agent:main:subagent:worker-1"]
+    assert marker_after["version"] == 3
+    assert marker_after["research_dir"] == str(research_dir)
     assert (research_dir / "round_02" / "01_seed_clues.json").exists()
     assert (research_dir / "round_02" / "02_task_registry.json").exists()
+
+
+def test_recover_reports_validation_errors_without_mutating_meta(tmp_path: Path) -> None:
+    workspace_dir = tmp_path / "workspace"
+    workspace_dir.mkdir()
+
+    started = run_cmd(
+        "start",
+        "--workspace-dir",
+        str(workspace_dir),
+        "--output-root",
+        str(workspace_dir),
+        "--topic",
+        "mmx-cli",
+        "--question",
+        "mmx-cli 是什么",
+        "--target-depth",
+        "1",
+        "--depth-mode",
+        "user-specified",
+        "--no-check",
+    )
+    research_dir = Path(started["research_dir"])
+
+    recovered = run_cmd(
+        "recover",
+        "--workspace-dir",
+        str(workspace_dir),
+        "--strict",
+    )
+    assert recovered["action"] == "recover"
+    assert recovered["validation_result"] == "FAIL"
+    assert recovered["next_action"] in {"repair_archive_file", "repair_archive", "repair_task_report", "repair_delta"}
+    assert recovered["errors"]
+    meta = json.loads((research_dir / "00_meta.json").read_text(encoding="utf-8"))
+    assert meta["status"] == "in_progress"
 
 
 def test_finalize_marks_completed_after_full_validation(tmp_path: Path) -> None:

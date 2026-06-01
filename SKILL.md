@@ -80,6 +80,16 @@ OpenClaw 中如果存在 `deep_research_session` 工具，**必须优先调用�
 
 这个动作会先校验全归档，再把研究状态原子收口到 `completed`。
 
+如果研究中途停止、换了聊天会话，或不确定下一步该做什么，优先调用：
+
+```json
+{
+  "action": "recover"
+}
+```
+
+它会读取当前活跃研究归档、运行检查器，并返回下一步最小修复或继续建议。OpenClaw runtime guard 默认是 lite 模式，主要依赖 `advance-round` / `finalize` / `recover` 这些 checkpoint，而不是在每个工具调用上做强拦截。
+
 只有在该工具不存在或不可用时，才允许退回到脚本方式：
 
 ```bash
@@ -426,9 +436,9 @@ python scripts/init_deep_research_archive.py --topic api-gateway --question "是
 - subagent 是 task worker，不是整场 deep-research 的 orchestrator；它的合法收尾条件是“完成自己负责的任务并交回结果”，不是把整个研究推进到 finalize
 - 即便并行执行，也要先完成任务登记，再把任务分发给 subagent；禁止边想边补登记表
 
-### 子代理等待机制（铁律）
+### 子代理等待机制（建议）
 
-OpenClaw 的子代理是 **push-based** 架构：spawn 后子代理在后台运行，完成后 completion event 会作为**下一条消息**推送给主 agent。主 agent 必须正确等待：
+OpenClaw 的子代理是 **push-based** 架构：spawn 后子代理在后台运行，完成后 completion event 会作为**下一条消息**推送给主 agent。为了减少丢消息和半成品归档，建议主 agent 正确等待：
 
 1. **spawn 所有子代理后，必须立即调用 `sessions_yield`**
 
@@ -438,14 +448,14 @@ OpenClaw 的子代理是 **push-based** 架构：spawn 后子代理在后台运�
 
 这会结束当前 turn，让 completion event 作为下一条消息到达。
 
-2. **禁止在 spawn 后做其他工具调用**：spawn → sessions_yield 必须紧密相连。
+2. **建议在 spawn 后尽快 yield**：spawn → sessions_yield 越紧密，越不容易出现主会话继续跑但子任务结果尚未到达的状态。
 
 3. **子代理完成事件到达后**，主 agent 被唤醒，此时必须：
    - 按 `02_task_registry.json` 中的 task_id 逐一验证 task report 文件
    - 有缺失的文件则标记为失败，可在下一批重试
    - 全部确认后才能进入 round summary 和 delta report 阶段
 
-4. **被唤醒后仍有子代理在运行，必须再次 yield**：如果某个子代理完成（成功或失败）唤醒了主 agent，但主 agent 检查发现同一批次中**还有其他子代理未完成**，则主 agent 在处理完已完成子代理的结果后，**必须再次调用 `sessions_yield`** 等待剩余 completion event 到达。不能因为"自己没有新的 spawn"就跳过 yield——研究尚未完成，主动挂起等待是唯一正确行为。
+4. **被唤醒后仍有子代理在运行，建议再次 yield**：如果某个子代理完成（成功或失败）唤醒了主 agent，但主 agent 检查发现同一批次中**还有其他子代理未完成**，则主 agent 在处理完已完成子代理的结果后，建议再次调用 `sessions_yield` 等待剩余 completion event 到达。
 
 ```json
 { "action": "sessions_yield", "message": "等待剩余子代理完成" }
@@ -453,8 +463,8 @@ OpenClaw 的子代理是 **push-based** 架构：spawn 后子代理在后台运�
 
 5. **多批次执行**：如果一轮 task 数量较多（>2 个），分批次 spawn（每批 2 个），每批都遵循 spawn → sessions_yield → 验证文件的流程。
 
-6. **绝对禁止**：
-   - ❌ spawn 后不调用 sessions_yield 就结束 turn
-   - ❌ 被唤醒后发现仍有子代理在运行却不再次 yield 就结束 turn
-   - ❌ 用 exec sleep 或 process poll 轮询子代理状态
-   - ❌ 用 sessions_list 轮询子代理状态
+6. **避免**：
+   - spawn 后长期不检查子任务产物
+   - 被唤醒后发现仍有子代理在运行却直接写轮次总结
+   - 用 exec sleep 或 process poll 长时间轮询子代理状态
+   - 用 sessions_list 高频轮询子代理状态

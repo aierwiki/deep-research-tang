@@ -9,6 +9,7 @@ Commands:
   activate      Bind an existing research directory as the active session
   advance-round Validate the current round, update meta, and scaffold the next round when needed
   finalize      Validate the full archive and mark the research completed
+  recover       Inspect the active archive and return the next repair/continuation step
   clear         Clear the active session binding
   status        Print the current active session binding
 """
@@ -113,21 +114,19 @@ def emit_and_persist(workspace_dir: Path, payload: dict, *, persist: bool = True
 
 def preserve_session_owner(workspace_dir: Path, payload: dict) -> dict:
     current = read_state(workspace_dir) or {}
-    for key in ("owner_session_id", "owner_session_key", "worker_session_keys"):
+    for key in ("last_seen_session_id", "last_seen_session_key"):
         if key in current and key not in payload:
             payload[key] = current[key]
-    if current.get("version") == 2 and payload.get("version") == 1:
-        payload["version"] = 2
     return payload
 
 
 def round_pass_payload(action: str, workspace_dir: Path, research_dir: Path, **extra: object) -> dict:
     payload = {
-        "version": 1,
+        "version": 3,
         "action": action,
         "workspace_dir": str(workspace_dir),
         "research_dir": str(research_dir),
-        "activated_at": utc_now(),
+        "updated_at": utc_now(),
     }
     payload.update(extra)
     return preserve_session_owner(workspace_dir, payload)
@@ -154,7 +153,7 @@ def cmd_start(args: argparse.Namespace) -> int:
     if not args.no_check:
         maybe_run_initial_check(research_dir)
     payload = {
-        "version": 1,
+        "version": 3,
         "action": "start",
         "workspace_dir": str(workspace_dir),
         "research_dir": str(research_dir),
@@ -163,6 +162,7 @@ def cmd_start(args: argparse.Namespace) -> int:
         "current_round": 1,
         "status": meta.status.value,
         "activated_at": utc_now(),
+        "updated_at": utc_now(),
     }
     write_state(workspace_dir, payload)
     emit(payload)
@@ -237,13 +237,60 @@ def cmd_finalize(args: argparse.Namespace) -> int:
     return 0
 
 
+def repair_instruction(report: dict, meta) -> tuple[str, str]:
+    errors = report.get("errors") or []
+    if not errors:
+        if meta.status.value == "completed":
+            return "completed", "Research is complete. Use final_report.md for the user-facing answer."
+        if meta.current_round >= meta.target_depth:
+            return "finalize", "All target rounds appear valid. Write/refine final_report.md if needed, then call deep_research_session finalize."
+        return "advance-round", "Current archive appears valid. Continue the current round or call deep_research_session advance-round at the checkpoint."
+
+    first = errors[0]
+    code = str(first.get("code", "ERR_UNKNOWN"))
+    detail = str(first.get("detail", ""))
+    round_num = first.get("round")
+    location = f"round {round_num}: " if round_num else ""
+    if "FINAL_REPORT" in code:
+        return "repair_final_report", f"Repair final_report.md: {detail}"
+    if code.startswith("ERR_TASK"):
+        return "repair_task_report", f"Repair task report issue in {location}{detail}"
+    if "DELTA" in code or "CLUE" in code:
+        return "repair_delta", f"Repair delta/clue chain in {location}{detail}"
+    if "MISSING_FILE" in code or "INVALID_JSON" in code:
+        return "repair_archive_file", f"Repair archive file in {location}{detail}"
+    return "repair_archive", f"Repair validation error {code}: {detail}"
+
+
+def cmd_recover(args: argparse.Namespace) -> int:
+    workspace_dir, research_dir = resolve_research_dir(args)
+    meta = load_meta(research_dir)
+    report = check_archive(research_dir, strict=args.strict, only_round=None)
+    next_action, instruction = repair_instruction(report, meta)
+    payload = round_pass_payload(
+        "recover",
+        workspace_dir,
+        research_dir,
+        strict=args.strict,
+        status=meta.status.value,
+        current_round=meta.current_round,
+        target_depth=meta.target_depth,
+        validation_result=report.get("result"),
+        errors=report.get("errors") or [],
+        next_action=next_action,
+        instruction=instruction,
+    )
+    emit_and_persist(workspace_dir, payload)
+    return 0
+
+
 def cmd_clear(args: argparse.Namespace) -> int:
     workspace_dir = args.workspace_dir.resolve()
     marker = state_file(workspace_dir)
     if marker.exists():
         marker.unlink()
     payload = {
-        "version": 1,
+        "version": 3,
         "action": "clear",
         "workspace_dir": str(workspace_dir),
         "cleared_at": utc_now(),
@@ -322,6 +369,12 @@ def build_parser() -> argparse.ArgumentParser:
     finalize.add_argument("--workspace-dir", type=Path, default=default_workspace_dir())
     finalize.add_argument("--strict", action="store_true")
     finalize.set_defaults(func=cmd_finalize)
+
+    recover = sub.add_parser("recover", help="inspect active archive and return next repair/continuation step")
+    recover.add_argument("--research-dir")
+    recover.add_argument("--workspace-dir", type=Path, default=default_workspace_dir())
+    recover.add_argument("--strict", action="store_true")
+    recover.set_defaults(func=cmd_recover)
 
     clear = sub.add_parser("clear", help="clear the active research archive binding")
     clear.add_argument("--workspace-dir", type=Path, default=default_workspace_dir())

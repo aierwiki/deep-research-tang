@@ -1,8 +1,8 @@
 {
   "id": "deep-research-guard",
   "name": "Deep Research Guard",
-  "description": "Enforces deep-research archive discipline with prompt guidance, tool gating, stop interception, and audit logging.",
-  "version": "1.7.0",
+  "description": "Lightweight OpenClaw runtime support for deep-research checkpoints, recovery, and stop reminders.",
+  "version": "1.8.0",
   "contracts": {
     "tools": [
       "deep_research_session"
@@ -22,6 +22,15 @@
       },
       "strict": {
         "type": "boolean"
+      },
+      "guardMode": {
+        "type": "string",
+        "enum": [
+          "lite",
+          "strict"
+        ],
+        "default": "lite",
+        "description": "lite only reminds/checkpoints and avoids most tool blocking; strict enables legacy stage/tool gates."
       },
       "subagentMaxRetries": {
         "type": "integer",

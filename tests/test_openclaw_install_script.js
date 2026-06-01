@@ -68,6 +68,7 @@ test("install_openclaw_deep_research writes merged plugin config", () => {
   assert.equal(entry.enabled, true);
   assert.equal(entry.config.scriptsDir, scriptsDir);
   assert.equal(entry.config.strict, true);
+  assert.equal(entry.config.guardMode, "lite");
   assert.equal("researchDir" in entry.config, false);
   assert.equal(entry.hooks.allowConversationAccess, true);
   assert.equal(entry.hooks.allowPromptInjection, true);
@@ -138,6 +139,7 @@ test("install_openclaw_deep_research is idempotent and preserves existing plugin
   assert.equal(entry.config.customNote, "keep-me");
   assert.equal(entry.config.scriptsDir, scriptsDir);
   assert.equal(entry.config.strict, true);
+  assert.equal(entry.config.guardMode, "lite");
   assert.equal("researchDir" in entry.config, false);
   assert.equal(entry.hooks.allowConversationAccess, true);
   assert.equal(entry.hooks.allowPromptInjection, true);
@@ -193,6 +195,34 @@ test("install_openclaw_deep_research removes stale load path for same plugin id"
 
   const config = readJson(configPath);
   assert.deepEqual(config.plugins.load.paths, [unrelatedPluginDir, pluginDir]);
+});
+
+test("install_openclaw_deep_research supports strict guard mode override", () => {
+  const tempRoot = makeTempDir("deep-research-install-mode-");
+  const configPath = path.join(tempRoot, "openclaw.json");
+  const workspaceDir = path.join(tempRoot, "workspace");
+
+  fs.writeFileSync(
+    configPath,
+    JSON.stringify(
+      {
+        agents: {
+          defaults: {
+            workspace: workspaceDir,
+          },
+        },
+      },
+      null,
+      2,
+    ) + "\n",
+    "utf8",
+  );
+
+  runInstaller(["--config-path", configPath, "--guard-mode", "strict", "--no-backup", "--no-registry-refresh", "--no-restart"]);
+
+  const config = readJson(configPath);
+  const entry = config.plugins.entries["deep-research-guard"];
+  assert.equal(entry.config.guardMode, "strict");
 });
 
 test("openclaw plugin manifest and package versions stay aligned", () => {

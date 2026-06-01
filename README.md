@@ -60,7 +60,7 @@ bash scripts/install_openclaw_deep_research.sh
 - 写入必要 hook 权限：
   - `plugins.entries.deep-research-guard.hooks.allowConversationAccess=true`
   - `plugins.entries.deep-research-guard.hooks.allowPromptInjection=true`
-- 写入插件配置 `scriptsDir`、`strict`
+- 写入插件配置 `scriptsDir`、`strict`、`guardMode`
 - 复制 `SKILL.md`、`scripts/`、`templates/` 到 OpenClaw workspace skills 目录
 - 刷新 OpenClaw plugin registry
 - 尝试重启 OpenClaw gateway
@@ -89,6 +89,7 @@ openclaw plugins doctor
 ```bash
 bash scripts/install_openclaw_deep_research.sh --dry-run
 bash scripts/install_openclaw_deep_research.sh --config-path /path/to/openclaw.json
+bash scripts/install_openclaw_deep_research.sh --guard-mode strict
 bash scripts/install_openclaw_deep_research.sh --strict false
 bash scripts/install_openclaw_deep_research.sh --no-restart
 ```
@@ -265,21 +266,22 @@ deep-research/
 
 ## OpenClaw 插件策略
 
-插件（v1.6.0+）在以下几个关键收口点精确干预，目标是"流程未满足时 Agent 既拿不到自然收工的落点，也会被推回当前研究上下文继续干活"：
+插件默认使用 `guardMode=lite`，目标是降低运行时脆弱性：不再在每个工具调用上做复杂阶段拦截，而是在轮次 checkpoint 上校验。
 
-- `before_agent_finalize`（**主要止停门禁**，2026.5.18+ 必须注册）：在 Codex/Pi agent 准备结束 run 时拦截。若归档尚未到达 `finalize` 阶段，返回 `{ action: "revise" }` 强制 agent 继续。这是 Codex 路径下唯一可靠的拦截点——只有注册此 hook，OpenClaw 才会把 `hooks.Stop` 指向中继命令而非置空
-- `before_prompt_build`：按当前归档阶段注入最小执行约束
-- `before_tool_call`：在规划未完成、总结未完成、检查失败等状态下阻断探索型工具
-- `before_message_write`（**备用止停门禁**）：兜底拦截 Pi 嵌入式路径的纯文本收工消息；如归档未完成则阻断并通过 `system event + heartbeat wake` 唤醒同一 session 继续执行
-- `after_tool_call`：解析会话信号、更新会话绑定、记录工具审计日志
-- `agent_end`：备用续跑触发 + 记录未完成退出，便于恢复和统计
+- `before_prompt_build`：只注入当前 active research 的简短状态和下一步 checkpoint 提醒
+- `before_tool_call`：lite 模式下只阻止未绑定会话时手工 bootstrap `research_*`，不再按阶段阻断搜索、exec、write 等正常操作
+- `before_agent_finalize`：如果 active research 尚未 `completed`，阻止明显提前停止，并提示调用 `deep_research_session status/recover` 继续
+- `after_tool_call`：解析 `deep_research_session` 信号、更新 active marker、写审计日志
+- `advance-round` / `finalize`：真正的强校验点，失败时返回检查器错误，由 Agent 修复后重试
+- `recover`：读取当前归档、运行检查器并返回下一步修复建议
 
-另外，当前版本已经显式区分两种会话角色：
+active research 现在绑定到 `workspace + research_dir`，chat/session id 只作为 `last_seen_session_*` 审计信息，不再作为访问控制边界。这样同一个 OpenClaw workspace 里的新会话可以显式 `status` / `recover` / `activate` 后继续研究。
 
-- orchestrator：主 deep-research 会话，负责轮次推进、检查器、最终收口
-- worker：由 OpenClaw subagent 扇出的任务执行会话，只负责单个已登记任务
+如果确实需要旧的强管控模式，可安装或配置：
 
-worker 不再被要求“必须把整个研究做到 finalize 才能停”，否则并行子任务会陷入错误的续跑循环。相反，worker 现在只允许写当前轮已登记的任务报告文件，不能改 `00_meta.json`、轮次总结、增量报告或 `final_report.md`。
+```bash
+bash scripts/install_openclaw_deep_research.sh --guard-mode strict
+```
 
 ### OpenClaw 安装提示
 
@@ -306,7 +308,7 @@ bash scripts/install_openclaw_deep_research.sh
 - 启用 `plugins.entries.deep-research-guard.enabled`
 - 写入 `plugins.entries.deep-research-guard.hooks.allowConversationAccess=true`
 - 写入 `plugins.entries.deep-research-guard.hooks.allowPromptInjection=true`
-- 写入 `scriptsDir`、`strict`
+- 写入 `scriptsDir`、`strict`、`guardMode`
 - 把完整 skill bundle 安装到 OpenClaw workspace skills 目录
 - 复制 `SKILL.md`、`scripts/`、`templates/`，让 skill 在 OpenClaw 里可独立运行
 - 刷新 OpenClaw plugin registry

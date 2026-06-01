@@ -6,8 +6,9 @@
  *
  * - before_prompt_build: inject the minimum current-step protocol so the agent
  *   is reminded what phase it is in and what is forbidden right now.
- * - before_tool_call: block exploratory work when archive/state prerequisites
- *   are missing, incomplete, or still placeholder-filled.
+ * - before_tool_call: in default lite mode, avoid stage/tool micromanagement and
+ *   only protect against manual inactive archive bootstrap. Legacy strict mode
+ *   still enables the older stage gates.
  * - before_agent_finalize: (PRIMARY stop guard, 2026.5.18+) intercept finalization
  *   via the native hook relay before Codex/Pi marks the run as done. Returns
  *   { action: "revise" } to force the agent to continue if the archive is incomplete.
@@ -221,6 +222,16 @@ function isStrictMode(api) {
     return cfg.strict;
   }
   return (process.env.DEEP_RESEARCH_STRICT || "1") !== "0";
+}
+
+function guardMode(api) {
+  const cfg = pluginConfig(api);
+  const raw = trimToString(cfg.guardMode || cfg.mode || process.env.DEEP_RESEARCH_GUARD_MODE).toLowerCase();
+  return raw === "strict" ? "strict" : "lite";
+}
+
+function isStrictGuard(api) {
+  return guardMode(api) === "strict";
 }
 
 function readMeta(rdir) {
@@ -846,7 +857,7 @@ function sessionToolParametersSchema() {
     properties: {
       action: {
         type: "string",
-        enum: ["start", "activate", "advance-round", "finalize", "status", "clear"],
+        enum: ["start", "activate", "advance-round", "finalize", "recover", "status", "clear"],
         description: "Session action to perform.",
       },
       topic: {
@@ -941,7 +952,7 @@ function sessionToolArgs(rawParams, api) {
     return args;
   }
 
-  if (action === "advance-round" || action === "finalize") {
+  if (action === "advance-round" || action === "finalize" || action === "recover") {
     const researchDir = trimToString(rawParams?.research_dir);
     if (researchDir) {
       args.push("--research-dir", researchDir);
@@ -1175,6 +1186,9 @@ function workerCanAccessResearch(payload, ctx) {
 }
 
 function sessionMatchesActiveResearch(payload, ctx) {
+  if (Number(payload?.version) >= 3) {
+    return true;
+  }
   if (sessionRole(ctx) === "worker") {
     return workerCanAccessResearch(payload, ctx);
   }
@@ -1191,12 +1205,12 @@ function rebindOwnedActiveSession(ctx, signal) {
   const marker = path.join(workspaceDir, ".deep-research", "active.json");
   const rebound = updateActiveSessionMarker(marker, (payload) => ({
     ...payload,
-    version: Math.max(Number(payload?.version) || 1, 2),
+    version: Math.max(Number(payload?.version) || 1, 3),
     workspace_dir: trimToString(payload?.workspace_dir) || workspaceDir,
     research_dir: researchDir,
-    owner_session_id: trimToString(ctx?.sessionId),
-    owner_session_key: trimToString(ctx?.sessionKey) || undefined,
-    worker_session_keys: [],
+    last_seen_session_id: trimToString(ctx?.sessionId) || undefined,
+    last_seen_session_key: trimToString(ctx?.sessionKey) || undefined,
+    updated_at: trimToString(signal?.activated_at) || new Date().toISOString(),
     activated_at: trimToString(signal?.activated_at) || trimToString(payload?.activated_at) || new Date().toISOString(),
   }));
 
@@ -1221,6 +1235,12 @@ function linkWorkerSession(requesterSessionKey, childSessionKey) {
   }
 
   const linked = updateActiveSessionMarker(marker, (payload) => {
+    if (Number(payload?.version) >= 3) {
+      return {
+        ...payload,
+        updated_at: new Date().toISOString(),
+      };
+    }
     const ownerSessionKey = trimToString(payload?.owner_session_key);
     const workerKeys = new Set(normalizeWorkerSessionKeys(payload?.worker_session_keys));
     if (requesterKey !== ownerSessionKey && !workerKeys.has(requesterKey)) {
@@ -1254,11 +1274,19 @@ function unlinkWorkerSession(targetSessionKey) {
     return null;
   }
 
-  return updateActiveSessionMarker(marker, (payload) => ({
-    ...payload,
-    version: Math.max(Number(payload?.version) || 1, 2),
-    worker_session_keys: normalizeWorkerSessionKeys(payload?.worker_session_keys).filter((key) => key !== targetKey),
-  }));
+  return updateActiveSessionMarker(marker, (payload) => {
+    if (Number(payload?.version) >= 3) {
+      return {
+        ...payload,
+        updated_at: new Date().toISOString(),
+      };
+    }
+    return {
+      ...payload,
+      version: Math.max(Number(payload?.version) || 1, 2),
+      worker_session_keys: normalizeWorkerSessionKeys(payload?.worker_session_keys).filter((key) => key !== targetKey),
+    };
+  });
 }
 
 function readActiveSession(ctx) {
@@ -1298,6 +1326,19 @@ function activeResearchDir(ctx) {
     return getCachedSession(key)?.researchDir || null;
   }
   return null;
+}
+
+function litePrompt(meta, rdir) {
+  const currentRound = Number(meta?.current_round) || 0;
+  const targetDepth = Number(meta?.target_depth) || "?";
+  const status = trimToString(meta?.status) || "unknown";
+  return [
+    "[deep-research-lite]",
+    `Active research archive: ${rdir}`,
+    `Progress: round ${currentRound}/${targetDepth}; status=${status}.`,
+    "Use deep_research_session for lifecycle checkpoints: status/recover, advance-round after each round, finalize after final_report.md.",
+    "The guard is intentionally permissive during tool use; checkpoint validation happens at advance-round/finalize.",
+  ].join("\n");
 }
 
 function bindActiveResearch(ctx, researchDir, marker = null) {
@@ -2187,10 +2228,16 @@ function register(api) {
     const stageInfo = detectArchiveStage(api, rdir, meta);
     auditLog(rdir, {
       hook: "before_prompt_build",
+      mode: guardMode(api),
       role: sessionRole(ctx),
       stage: stageInfo.stage,
       round: meta.current_round,
     });
+    if (!isStrictGuard(api)) {
+      return {
+        prependContext: litePrompt(meta, rdir),
+      };
+    }
     return {
       prependContext:
         sessionRole(ctx) === "worker"
@@ -2214,6 +2261,19 @@ function register(api) {
       return {};
     }
     bindActiveResearch(ctx, rdir);
+
+    if (!isStrictGuard(api)) {
+      const { toolName, toolCallId } = event;
+      auditLog(rdir, {
+        hook: "before_tool_call",
+        mode: "lite",
+        role: sessionRole(ctx),
+        action: "ALLOW",
+        tool: toolName,
+        toolCallId,
+      });
+      return {};
+    }
 
     const meta = readMeta(rdir);
     if (!meta) {
@@ -2298,6 +2358,7 @@ function register(api) {
       signal?.action === "start" ||
       signal?.action === "activate" ||
       signal?.action === "advance-round" ||
+      signal?.action === "recover" ||
       signal?.action === "finalize"
     ) {
       const rebound = rebindOwnedActiveSession(ctx, signal);
@@ -2316,7 +2377,7 @@ function register(api) {
 
     markToolActivity(ctx, event);
     const { toolName, toolCallId, durationMs } = event;
-    auditLog(rdir, { hook: "after_tool_call", role: sessionRole(ctx), tool: toolName, toolCallId, durationMs });
+    auditLog(rdir, { hook: "after_tool_call", mode: guardMode(api), role: sessionRole(ctx), tool: toolName, toolCallId, durationMs });
   });
 
   // PRIMARY stop guard for Codex path (OpenClaw 2026.5.18+).
@@ -2345,11 +2406,41 @@ function register(api) {
     if (stageInfo.stage === "finalize") {
       auditLog(rdir, {
         hook: "before_agent_finalize",
+        mode: guardMode(api),
         action: "ALLOW",
         stage: stageInfo.stage,
         round: meta.current_round,
       });
       return; // archive is complete — allow normal finalization
+    }
+
+    if (!isStrictGuard(api)) {
+      const currentRound = Number(meta?.current_round) || 0;
+      const targetDepth = Number(meta?.target_depth) || "?";
+      const status = trimToString(meta?.status) || "unknown";
+      const reason = [
+        "[deep-research-lite] Active research is not completed yet.",
+        `Progress: round ${currentRound}/${targetDepth}; status=${status}; stage=${stageInfo.stage}.`,
+        "Call deep_research_session status or recover, then continue the remaining checkpoint work.",
+        "Only stop after deep_research_session finalize succeeds and 00_meta.json status is completed.",
+      ].join("\n");
+      const idempotencyKey = `deep-research-lite-finalize:${stageInfo.stage}:${currentRound}`;
+      auditLog(rdir, {
+        hook: "before_agent_finalize",
+        mode: "lite",
+        action: "REVISE",
+        stage: stageInfo.stage,
+        round: meta.current_round,
+      });
+      return {
+        action: "revise",
+        reason,
+        retry: {
+          instruction: reason,
+          idempotencyKey,
+          maxAttempts: 3,
+        },
+      };
     }
 
     // --- Auto-yield enforcement at finalize: if spawns are pending, force yield first ---
@@ -2438,6 +2529,9 @@ function register(api) {
     if (!meta) {
       return {};
     }
+    if (!isStrictGuard(api)) {
+      return {};
+    }
     if (isAssistantMessage(event?.message)) {
       clearPendingToolContinuation(ctx);
     }
@@ -2471,9 +2565,12 @@ function register(api) {
 
     const meta = readMeta(rdir);
     const stageInfo = meta ? detectArchiveStage(api, rdir, meta) : { stage: "unknown", summary: "" };
-    maybeResumeAfterToolIdle(api, ctx, rdir, meta, stageInfo, event);
+    if (isStrictGuard(api)) {
+      maybeResumeAfterToolIdle(api, ctx, rdir, meta, stageInfo, event);
+    }
     auditLog(rdir, {
       hook: "agent_end",
+      mode: guardMode(api),
       role: sessionRole(ctx),
       success: event.success,
       stage: stageInfo.stage,
@@ -2496,7 +2593,9 @@ function register(api) {
     const childSessionKey = trimToString(ctx?.childSessionKey) || trimToString(event?.childSessionKey);
     linkWorkerSession(requesterSessionKey, childSessionKey);
     // Auto-yield enforcement: mark orchestrator as having unyielded spawns
-    markSubagentSpawned(requesterSessionKey);
+    if (isStrictGuard(api)) {
+      markSubagentSpawned(requesterSessionKey);
+    }
   });
 
   api.on("subagent_ended", (event, ctx) => {
@@ -2750,10 +2849,13 @@ module.exports = {
   id: "deep-research-guard",
   name: "Deep Research Guard",
   description:
-    "Enforces deep-research archive discipline with prompt guidance, tool gating, stop interception, and audit logging.",
-  version: "1.7.0",
+    "Lightweight deep-research checkpoints, recovery, and stop reminders for OpenClaw.",
+  version: "1.8.0",
   register,
   __testing: {
+    guardMode,
+    isStrictGuard,
+    litePrompt,
     detectArchiveStage,
     shouldBlockToolForStage,
     isExploratoryTool,

@@ -676,7 +676,27 @@ test("readActiveSession loads workspace marker state", () => {
   assert.equal(session?.researchDir, researchDir);
 });
 
-test("activeResearchDir only activates for the owning sessionId", () => {
+test("activeResearchDir accepts v3 workspace binding from any same-workspace session", () => {
+  plugin.__testing.resetGuardActivation();
+  const workspaceDir = fs.mkdtempSync(path.join(os.tmpdir(), "deep-research-workspace-"));
+  const researchDir = path.join(workspaceDir, "research_20260417_demo");
+  fs.mkdirSync(path.join(workspaceDir, ".deep-research"), { recursive: true });
+  fs.mkdirSync(researchDir, { recursive: true });
+  writeJson(path.join(workspaceDir, ".deep-research", "active.json"), {
+    version: 3,
+    research_dir: researchDir,
+    last_seen_session_key: "agent:main:old",
+  });
+
+  const bound = plugin.__testing.activeResearchDir({
+    workspaceDir,
+    sessionId: "session-new",
+    sessionKey: "agent:main:new",
+  });
+  assert.equal(bound, researchDir);
+});
+
+test("legacy v2 activeResearchDir still honors owner binding", () => {
   plugin.__testing.resetGuardActivation();
   const workspaceDir = fs.mkdtempSync(path.join(os.tmpdir(), "deep-research-workspace-"));
   const researchDir = path.join(workspaceDir, "research_20260417_demo");
@@ -689,14 +709,6 @@ test("activeResearchDir only activates for the owning sessionId", () => {
     owner_session_key: "agent:main:main",
     worker_session_keys: [],
   });
-
-  const bound = plugin.__testing.activeResearchDir({
-    workspaceDir,
-    sessionId: "session-owner",
-    sessionKey: "session-research",
-  });
-  assert.equal(bound, researchDir);
-
   const other = plugin.__testing.activeResearchDir({
     workspaceDir,
     sessionId: "session-new",
@@ -729,7 +741,7 @@ test("activeResearchDir uses cached binding for later hooks without workspaceDir
   assert.equal(cached, researchDir);
 });
 
-test("rebindOwnedActiveSession stamps owner session metadata onto the marker", () => {
+test("rebindOwnedActiveSession stamps soft last-seen session metadata onto the marker", () => {
   plugin.__testing.resetGuardActivation();
   const workspaceDir = fs.mkdtempSync(path.join(os.tmpdir(), "deep-research-workspace-"));
   const researchDir = path.join(workspaceDir, "research_20260417_demo");
@@ -758,12 +770,14 @@ test("rebindOwnedActiveSession stamps owner session metadata onto the marker", (
   const payload = JSON.parse(
     fs.readFileSync(path.join(workspaceDir, ".deep-research", "active.json"), "utf8"),
   );
-  assert.equal(payload.owner_session_id, "session-owner");
-  assert.equal(payload.owner_session_key, "agent:main:main");
-  assert.deepEqual(payload.worker_session_keys, []);
+  assert.equal(payload.version, 3);
+  assert.equal(payload.last_seen_session_id, "session-owner");
+  assert.equal(payload.last_seen_session_key, "agent:main:main");
+  assert.equal(payload.owner_session_id, undefined);
+  assert.equal(payload.worker_session_keys, undefined);
 });
 
-test("session lifecycle tool signals rebind owner after advance-round", async () => {
+test("session lifecycle tool signals update soft binding after advance-round", async () => {
   plugin.__testing.resetGuardActivation();
   const workspaceDir = fs.mkdtempSync(path.join(os.tmpdir(), "deep-research-workspace-"));
   const researchDir = path.join(workspaceDir, "research_20260417_demo");
@@ -802,8 +816,9 @@ test("session lifecycle tool signals rebind owner after advance-round", async ()
   const payload = JSON.parse(
     fs.readFileSync(path.join(workspaceDir, ".deep-research", "active.json"), "utf8"),
   );
-  assert.equal(payload.owner_session_id, "session-owner");
-  assert.equal(payload.owner_session_key, "agent:main:dashboard:owner");
+  assert.equal(payload.version, 3);
+  assert.equal(payload.last_seen_session_id, "session-owner");
+  assert.equal(payload.last_seen_session_key, "agent:main:dashboard:owner");
 });
 
 test("legacy workspace-only markers stay dormant until re-activated", () => {
@@ -859,6 +874,35 @@ test("linked worker sessions inherit access without broadening to new main sessi
     sessionKey: "agent:main:main",
   });
   assert.equal(unrelated, null);
+});
+
+test("v3 linked worker sessions do not restrict unrelated same-workspace chats", () => {
+  plugin.__testing.resetGuardActivation();
+  const workspaceDir = fs.mkdtempSync(path.join(os.tmpdir(), "deep-research-workspace-"));
+  const researchDir = path.join(workspaceDir, "research_20260417_demo");
+  fs.mkdirSync(path.join(workspaceDir, ".deep-research"), { recursive: true });
+  fs.mkdirSync(researchDir, { recursive: true });
+  writeJson(path.join(workspaceDir, ".deep-research", "active.json"), {
+    version: 3,
+    research_dir: researchDir,
+    last_seen_session_key: "agent:main:main",
+  });
+
+  plugin.__testing.activeResearchDir({
+    workspaceDir,
+    sessionId: "session-owner",
+    sessionKey: "agent:main:main",
+  });
+  plugin.__testing.linkWorkerSession("agent:main:main", "agent:main:subagent:worker-1");
+
+  assert.equal(
+    plugin.__testing.activeResearchDir({
+      workspaceDir,
+      sessionId: "session-new",
+      sessionKey: "agent:main:other",
+    }),
+    researchDir,
+  );
 });
 
 test("unlinkWorkerSession removes child access from the marker and cache", () => {
@@ -922,6 +966,7 @@ test("deep research session tool exposes lifecycle actions", () => {
     "activate",
     "advance-round",
     "finalize",
+    "recover",
     "status",
     "clear",
   ]);
@@ -958,6 +1003,79 @@ test("validateInactiveArchiveBootstrap allows non-archive writes without a bound
     "/Users/tangyubin/.openclaw/workspace",
   );
   assert.equal(result.ok, true);
+});
+
+test("default lite before_tool_call allows exploratory tools during planning", async () => {
+  plugin.__testing.resetGuardActivation();
+  const workspaceDir = fs.mkdtempSync(path.join(os.tmpdir(), "deep-research-workspace-"));
+  const researchDir = path.join(workspaceDir, "research_20260417_demo");
+  fs.mkdirSync(path.join(workspaceDir, ".deep-research"), { recursive: true });
+  fs.mkdirSync(researchDir, { recursive: true });
+  writeJson(path.join(workspaceDir, ".deep-research", "active.json"), {
+    version: 3,
+    workspace_dir: workspaceDir,
+    research_dir: researchDir,
+  });
+  writeJson(path.join(researchDir, "00_meta.json"), {
+    topic: "demo",
+    original_question: "q?",
+    target_depth: 2,
+    depth_mode: "user-specified",
+    current_round: 1,
+    status: "in_progress",
+  });
+
+  const handlers = {};
+  plugin.register({
+    pluginConfig: {},
+    registerTool: () => {},
+    on: (name, handler) => {
+      handlers[name] = handler;
+    },
+  });
+
+  const result = await handlers.before_tool_call(
+    { toolName: "exec", params: { command: "mmx search demo" } },
+    { workspaceDir, sessionKey: "agent:main:new", sessionId: "session-new" },
+  );
+  assert.deepEqual(result, {});
+});
+
+test("strict before_tool_call keeps legacy stage blocking", async () => {
+  plugin.__testing.resetGuardActivation();
+  const workspaceDir = fs.mkdtempSync(path.join(os.tmpdir(), "deep-research-workspace-"));
+  const researchDir = path.join(workspaceDir, "research_20260417_demo");
+  fs.mkdirSync(path.join(workspaceDir, ".deep-research"), { recursive: true });
+  fs.mkdirSync(researchDir, { recursive: true });
+  writeJson(path.join(workspaceDir, ".deep-research", "active.json"), {
+    version: 3,
+    workspace_dir: workspaceDir,
+    research_dir: researchDir,
+  });
+  writeJson(path.join(researchDir, "00_meta.json"), {
+    topic: "demo",
+    original_question: "q?",
+    target_depth: 2,
+    depth_mode: "user-specified",
+    current_round: 1,
+    status: "in_progress",
+  });
+
+  const handlers = {};
+  plugin.register({
+    pluginConfig: { guardMode: "strict" },
+    registerTool: () => {},
+    on: (name, handler) => {
+      handlers[name] = handler;
+    },
+  });
+
+  const result = await handlers.before_tool_call(
+    { toolName: "exec", params: { command: "mmx search demo" } },
+    { workspaceDir, sessionKey: "agent:main:new", sessionId: "session-new" },
+  );
+  assert.equal(result.block, true);
+  assert.match(result.blockReason, /Round 1 prerequisites missing/i);
 });
 
 test("isTerminalAssistantMessage detects plain stop replies without tool use", () => {
